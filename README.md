@@ -44,6 +44,25 @@ uv sync --extra dev
 source .venv/bin/activate
 ```
 
+## Run a task from your own loop
+
+An episode is one run of a task in which some of its agents are played from outside AgentEnv, by a training loop's model or any code of your own. AgentEnv runs the rest exactly as `agent-env run` does, deploying the envs, running the other agents and scoring, and waits at each of your agent's turns:
+
+```python
+from agentenv_protocol import ToolSession
+from agent_env.task import EpisodeSpec, Task
+
+spec = EpisodeSpec.from_task(Task.get("my-task"))
+episode = await spec.start()
+turn = await episode.next_turn()
+async with ToolSession(mcp_url=turn.mcp_urls["my-env"], role=turn.role, headers=turn.headers["my-env"]) as tools:
+    ...  # your model reads turn.prompt and calls tools.call_tool(name, arguments)
+await turn.end(response="Done.")
+reward = await episode.result()
+```
+
+The reward is the score of the task's one top-level verifier, `episode.abandon(reason)` stops a run early, and `from_task` names any step an outside player can't stand behind. [Running tasks](https://www.agentenvframework.com/docs/tasks/running) covers the rest.
+
 ## Plugins
 
 A package of your own can add env types, providers, task steps and stores to agent-env, and `agent-env plugin` lists, checks, adds and removes installed plugins. The [plugin docs](https://www.agentenvframework.com/docs/plugins) show how.
