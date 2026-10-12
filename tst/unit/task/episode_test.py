@@ -1,10 +1,20 @@
 """An episode: a run of a task with some of its agents played from outside. What ``EpisodeSpec.from_task`` reads off
-a task (the outside agents, their turns, the reward), what it refuses, and the copy of the task it runs."""
+a task (the outside agents, their turns, the reward), what it refuses, and the copy of the task it runs; then the run
+itself: its turns, its reward, abandoning it, teardown and its record."""
+
+import asyncio
 
 import pytest
+import pytest_asyncio
 
+import agent_env.task.episode as episode_module
+from agent_env.config.runtime import Config
+from agent_env.env.env import DeployedEnv
 from agent_env.task import AgentSpec, EpisodeError, EpisodeSpec, Task, TurnSpec
 from agent_env.task.episode import _EpisodeAgentStep, _EpisodeTurnStep
+from agent_env.task.task import substitute_seed_in_steps
+from agent_env.task.teardown import TeardownReport
+from agent_env.task_step.task_step import TaskStep
 from agent_env.task_step.task_steps.deploy_agent import DeployAgentTaskStep
 from agent_env.task_step.task_steps.prompt_agent import PromptAgentTaskStep
 
@@ -123,7 +133,7 @@ def test_an_inside_agent_keeps_its_own_steps():
 
 def test_the_reward_is_the_verifier_no_aggregate_lists():
     graded = {"id": "graded", "type": "agent_prompt_response_verifier", "prompt_id": "play", "verifier_id": "reply",
-              "criteria": [{"id": "c", "expected": "berths"}]}
+              "criteria": [{"type": "response_contains", "needles": ["berths"]}]}
     overall = {"id": "overall", "type": "aggregate_verifiers", "verifier_ids": ["berth", "reply"],
                "verifier_id": "overall"}
 
@@ -228,7 +238,7 @@ def test_every_refusal_is_reported_at_once():
 ALLOWED = {
     "a reply verifier on an outside prompt": (
         {"verify": {"id": "graded", "type": "agent_prompt_response_verifier", "prompt_id": "play",
-                    "criteria": [{"id": "c", "expected": "berths"}]}},),
+                    "criteria": [{"type": "response_contains", "needles": ["berths"]}]}},),
     "a rubric of the reply alone": (
         {"verify": {"id": "rubric", "type": "rubrics_verifier", "prompt_id": "play", "criteria": [],
                     "use_trajectory": False, "use_agent_judge": False}},),
@@ -242,3 +252,385 @@ ALLOWED = {
 @pytest.mark.parametrize("replace", [case[0] for case in ALLOWED.values()], ids=ALLOWED.keys())
 def test_steps_that_need_only_what_an_outside_player_leaves_are_allowed(replace):
     EpisodeSpec.from_task(_portsim(**replace))
+
+
+class _Env(TaskStep):
+    """Deploys ``env_id`` with no sandbox, or fails as an env that doesn't come up."""
+
+    type = "episode_test_env"
+    entity_refs = ()
+
+    def __init__(self, id, version, env_id="items", fail=False, depends_on=None, fail_task_on_error=True):
+        super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
+        self.env_id = env_id
+        self.fail = fail
+
+    def to_dict(self):
+        return {**super().to_dict(), "env_id": self.env_id, "fail": self.fail}
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(**cls._base_from_dict(data), env_id=data.get("env_id", "items"), fail=data.get("fail", False))
+
+    async def execute(self, context):
+        if self.fail:
+            raise RuntimeError("the env didn't come up")
+        context.deployed_envs.append(DeployedEnv(
+            env_id=self.env_id, env_version=1, mcp_url=f"http://127.0.0.1:20031/{self.env_id}/mcp",
+            metadata={"deploy_step_id": self.id},
+        ))
+        return context
+
+
+GATES: dict[str, asyncio.Event] = {}
+
+
+def _gate(step_id):
+    return GATES.setdefault(step_id, asyncio.Event())
+
+
+class _Gate(TaskStep):
+    """Waits until the test opens the gate of its id."""
+
+    type = "episode_test_gate"
+    entity_refs = ()
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(**cls._base_from_dict(data))
+
+    async def execute(self, context):
+        await _gate(self.id).wait()
+        return context
+
+
+class _Replies(TaskStep):
+    """Scores 1 when the run recorded replies and every one has text, else 0."""
+
+    type = "episode_test_replies"
+    entity_refs = ()
+
+    def __init__(self, id, version, verifier_id="replies", depends_on=None, fail_task_on_error=True):
+        super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
+        self.verifier_id = verifier_id
+
+    def to_dict(self):
+        return {**super().to_dict(), "verifier_id": self.verifier_id}
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(**cls._base_from_dict(data), verifier_id=data["verifier_id"])
+
+    async def execute(self, context):
+        replies = [response.response for response in context.prompt_responses]
+        context.metadata.setdefault("verifications", {})[self.verifier_id] = {
+            "score": float(bool(replies) and all(replies))}
+        return context
+
+
+class _Teardowns:
+    """Stands in for ``teardown_run``: records each run it tears down, and waits on ``hold`` when it's set."""
+
+    def __init__(self):
+        self.started = []
+        self.finished = []
+        self.hold = None
+
+    async def __call__(self, context, **_):
+        self.started.append(context.instance_id)
+        if self.hold is not None:
+            await self.hold.wait()
+        self.finished.append(context.instance_id)
+        return TeardownReport()
+
+
+@pytest.fixture
+def teardowns(monkeypatch, local_stores):
+    steps = {**Config().task_step_registry(), **{step.type: step for step in (_Env, _Gate, _Replies)}}
+    monkeypatch.setattr(Config, "task_step_registry", lambda self: steps)
+    GATES.clear()
+    teardowns = _Teardowns()
+    monkeypatch.setattr(episode_module, "teardown_run", teardowns)
+    return teardowns
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _no_episode_outlives_its_test():
+    yield
+    for episode in list(episode_module._live.values()):
+        await episode.abandon("the test ended")
+
+
+ITEMS = {"id": "items", "type": "episode_test_env"}
+ALICE = {"id": "alice", "type": "deploy_agent", "agent_name": "alice", "env_ids": ["items"],
+         "role": "alice@example.com", "system_prompt": "You keep the items."}
+TURN = {"id": "turn", "type": "prompt_agent", "agent_name": "alice", "prompt_id": "turn", "prompt": "Add a crate.",
+        "timeout_seconds": 5}
+REPLIES = {"id": "replies", "type": "episode_test_replies", "verifier_id": "replies"}
+
+
+def _spec(*steps, **kwargs):
+    return EpisodeSpec.from_task(_task(*steps), **kwargs)
+
+
+async def _ended(episode):
+    await asyncio.wait((episode._run,))
+
+
+async def _until(holds):
+    async with asyncio.timeout(5):
+        while not holds():
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_the_run_waits_at_an_outside_turn_and_carries_on_once_it_ends(teardowns):
+    episode = await _spec(ITEMS, ALICE, TURN, REPLIES).start()
+    assert Task.get_instance(episode.id).status == "running"
+
+    turn = await episode.next_turn()
+    assert (turn.agent, turn.step_id, turn.prompt, turn.system_prompt, turn.role) == (
+        "alice", "turn", "Add a crate.", "You keep the items.", "alice@example.com")
+    assert (turn.mcp_urls, turn.headers) == ({"items": "http://127.0.0.1:20031/items/mcp"}, {"items": {}})
+
+    await turn.end("Added a crate.")
+    assert await episode.result() == 1.0
+    assert await episode.next_turn() is None
+    assert teardowns.finished == [episode.id]
+    record = Task.get_instance(episode.id)
+    assert record.status == "completed"
+    assert record.context["metadata"]["episode"] == {"id": episode.id, "agents": ["alice"]}
+    assert [(r["step_id"], r["prompt_text"], r["response"]) for r in record.context["prompt_responses"]] == [
+        ("turn", "Add a crate.", "Added a crate.")]
+    assert record.context["deployed_agents"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_turn_carries_the_headers_each_url_needs(teardowns, monkeypatch):
+    monkeypatch.setattr(episode_module, "sandbox_request_headers_for_url", lambda url: {"X-Sandbox": url})
+    episode = await _spec(ITEMS, ALICE, TURN, REPLIES).start()
+
+    turn = await episode.next_turn()
+
+    assert turn.headers == {"items": {"X-Sandbox": "http://127.0.0.1:20031/items/mcp"}}
+
+
+@pytest.mark.asyncio
+async def test_two_outside_agents_turns_are_each_handed_out_once(teardowns):
+    bob = {**ALICE, "id": "bob", "agent_name": "bob", "role": None, "depends_on": ["items"]}
+    bob_turn = {**TURN, "id": "bob-turn", "agent_name": "bob", "prompt_id": "bob-turn", "depends_on": ["bob"]}
+    episode = await _spec(
+        ITEMS, {**ALICE, "depends_on": ["items"]}, bob, {**TURN, "depends_on": ["alice"]}, bob_turn,
+        {**REPLIES, "depends_on": ["turn", "bob-turn"]}, agents=["alice", "bob"],
+    ).start()
+
+    first = await episode.next_turn()
+    second = await episode.next_turn()
+    assert {first.agent, second.agent} == {"alice", "bob"}
+    await first.end("one")
+    await second.end("two")
+
+    assert await episode.result() == 1.0
+
+
+@pytest.mark.asyncio
+async def test_episodes_of_one_spec_run_side_by_side_each_with_its_own_record(teardowns):
+    spec = _spec(ITEMS, ALICE, TURN, REPLIES)
+
+    async def play(n):
+        episode = await spec.start()
+        await (await episode.next_turn()).end(f"crate {n}")
+        return episode.id, await episode.result()
+
+    played = dict(await asyncio.gather(*(play(n) for n in range(8))))
+
+    assert list(played.values()) == [1.0] * 8
+    assert sorted(teardowns.finished) == sorted(played)
+    assert sorted(Task.get_instance(id).context["prompt_responses"][0]["response"] for id in played) == [
+        f"crate {n}" for n in range(8)]
+
+
+@pytest.mark.asyncio
+async def test_a_seed_reaches_the_agents_env_binding_and_role(teardowns):
+    episode = await _spec(
+        {**ITEMS, "env_id": "<env>"}, {**ALICE, "env_ids": ["<env>"], "role": "<who>"}, TURN, REPLIES,
+        seed={"env": "pantry", "who": "bob@example.com"},
+    ).start()
+
+    turn = await episode.next_turn()
+
+    assert (turn.mcp_urls, turn.role) == ({"pantry": "http://127.0.0.1:20031/pantry/mcp"}, "bob@example.com")
+
+
+def test_the_seed_pass_rebuilds_each_step_as_its_own_class():
+    class _Unregistered(_Replies):
+        pass
+
+    steps = [*_portsim().steps, _Unregistered(id="extra", version=None, verifier_id="<port>")]
+
+    seeded = substitute_seed_in_steps(steps, SEED)
+
+    assert [type(step) for step in seeded] == [type(step) for step in steps]
+    assert (seeded[2].role, seeded[3].prompt, seeded[-1].verifier_id) == ("planner@Valencia", "Plan week 3.", "Valencia")
+
+
+@pytest.mark.asyncio
+async def test_a_setup_failure_reaches_the_caller_waiting_for_a_turn(teardowns):
+    episode = await _spec({**ITEMS, "fail": True}, ALICE, TURN, REPLIES).start()
+
+    with pytest.raises(RuntimeError, match="the env didn't come up"):
+        await episode.next_turn()
+    with pytest.raises(RuntimeError, match="the env didn't come up"):
+        await episode.result()
+    assert Task.get_instance(episode.id).status == "failed"
+    assert teardowns.finished == [episode.id]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_not_taken_by_its_deadline_fails_the_run_and_is_never_handed_out(teardowns):
+    episode = await _spec(ITEMS, ALICE, {**TURN, "timeout_seconds": 0.05}, REPLIES).start()
+    await _ended(episode)
+
+    with pytest.raises(TimeoutError, match="turn 'turn' of agent 'alice' wasn't ended within 0.05s"):
+        await episode.next_turn()
+    assert Task.get_instance(episode.id).status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_turn_ended_after_its_deadline_changes_nothing(teardowns):
+    episode = await _spec(ITEMS, ALICE, {**TURN, "timeout_seconds": 0.05}, REPLIES).start()
+    turn = await episode.next_turn()
+    await _ended(episode)
+
+    await turn.end("too late")
+
+    with pytest.raises(TimeoutError, match="wasn't ended within 0.05s"):
+        await episode.result()
+    record = Task.get_instance(episode.id)
+    assert record.status == "failed" and "wasn't ended within 0.05s" in record.error
+    assert record.context["prompt_responses"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_tolerant_turn_past_its_deadline_is_scored_without_a_reply(teardowns):
+    episode = await _spec(ITEMS, ALICE, {**TURN, "timeout_seconds": 0.05, "fail_task_on_error": False}, REPLIES).start()
+    await _ended(episode)
+
+    assert await episode.result() == 0.0
+    assert await episode.next_turn() is None
+    assert [f["step_id"] for f in Task.get_instance(episode.id).context["metadata"]["failed_steps"]] == ["turn"]
+
+
+@pytest.mark.asyncio
+async def test_the_result_is_refused_while_a_turn_waits_or_is_open(teardowns):
+    episode = await _spec(ITEMS, ALICE, TURN, REPLIES).start()
+
+    with pytest.raises(EpisodeError, match="turn 'turn' of agent 'alice' isn't ended, so the run can't finish"):
+        await episode.result()
+    turn = await episode.next_turn()
+    with pytest.raises(EpisodeError, match="isn't ended"):
+        await episode.result()
+    await turn.end("done")
+    assert await episode.result() == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("reply", "reward"), [("Added a crate.", 1.0), (None, 0.0)])
+async def test_the_reply_is_graded_as_a_prompt_agents_would_be(teardowns, reply, reward):
+    graded = {"id": "graded", "type": "agent_prompt_response_verifier", "prompt_id": "turn", "verifier_id": "graded",
+              "criteria": [{"type": "response_contains", "needles": ["crate"]}]}
+    episode = await _spec(ITEMS, ALICE, TURN, graded).start()
+
+    await (await episode.next_turn()).end(reply)
+
+    assert await episode.result() == reward
+
+
+@pytest.mark.asyncio
+async def test_an_episode_abandoned_as_it_starts_is_recorded_cancelled_with_the_reason(teardowns):
+    episode = await _spec(ITEMS, ALICE, TURN, REPLIES).start()
+
+    await episode.abandon("the trainer moved on")
+
+    record = Task.get_instance(episode.id)
+    assert (record.status, record.error) == ("cancelled", "the trainer moved on")
+    assert teardowns.finished == [episode.id]
+    for ask in (episode.next_turn, episode.result):
+        with pytest.raises(EpisodeError, match="episode abandoned: the trainer moved on"):
+            await ask()
+
+
+@pytest.mark.asyncio
+async def test_an_episode_abandoned_mid_turn_drops_the_turn(teardowns):
+    episode = await _spec(ITEMS, ALICE, TURN, REPLIES).start()
+    turn = await episode.next_turn()
+
+    await episode.abandon("a tool call failed")
+    await turn.end("too late")
+
+    record = Task.get_instance(episode.id)
+    assert (record.status, record.error, record.context["prompt_responses"]) == (
+        "cancelled", "a tool call failed", [])
+    assert teardowns.finished == [episode.id]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_waiting_when_the_episode_is_abandoned_is_never_handed_out(teardowns):
+    episode = await _spec(ITEMS, ALICE, TURN, REPLIES).start()
+    await _until(lambda: episode._waiting)
+
+    abandoning = asyncio.create_task(episode.abandon("stop"))
+    await asyncio.sleep(0)
+    with pytest.raises(EpisodeError, match="episode abandoned: stop"):
+        await episode.next_turn()
+    await abandoning
+
+
+@pytest.mark.asyncio
+async def test_abandoning_during_teardown_waits_for_it_and_leaves_the_runs_outcome(teardowns):
+    teardowns.hold = asyncio.Event()
+    episode = await _spec(ITEMS, ALICE, TURN, REPLIES).start()
+    await (await episode.next_turn()).end("done")
+    await _until(lambda: teardowns.started)
+
+    abandoning = asyncio.create_task(episode.abandon("too late"))
+    await asyncio.sleep(0.05)
+    assert not abandoning.done()
+    teardowns.hold.set()
+    await abandoning
+
+    assert teardowns.finished == [episode.id]
+    assert await episode.result() == 1.0
+    assert Task.get_instance(episode.id).status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_caller_cancels_only_its_wait(teardowns):
+    gate = {"id": "before", "type": "episode_test_gate"}
+    episode = await _spec(ITEMS, ALICE, gate, TURN, {**gate, "id": "after"}, REPLIES).start()
+
+    waiting = asyncio.create_task(episode.next_turn())
+    await asyncio.sleep(0.01)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    _gate("before").set()
+    await (await episode.next_turn()).end("done")
+
+    scoring = asyncio.create_task(episode.result())
+    await asyncio.sleep(0.01)
+    scoring.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await scoring
+    _gate("after").set()
+    assert await episode.result() == 1.0
+
+
+@pytest.mark.asyncio
+async def test_a_run_group_id_groups_the_record(teardowns):
+    episode = await _spec(ITEMS, ALICE, TURN, REPLIES).start(run_group_id="grpo-step-7")
+
+    await (await episode.next_turn()).end("done")
+    await episode.result()
+
+    assert Task.get_instance(episode.id).context["metadata"]["run_group_id"] == "grpo-step-7"

@@ -1,7 +1,7 @@
 """Task module for AgentEnv."""
 
 from .task import Task
-from .episode import AgentSpec, EpisodeError, EpisodeSpec, TurnSpec
+from .episode import AgentSpec, Episode, EpisodeError, EpisodeSpec, Turn, TurnSpec
 from .store import (
     TaskStore, TaskQuery, get_task_store, set_task_store, reset_task_store,
     TaskInstance, TaskInstanceStore, get_task_instance_store, set_task_instance_store, reset_task_instance_store,
@@ -11,8 +11,10 @@ from .store import (
 __all__ = [
     "Task",
     "AgentSpec",
+    "Episode",
     "EpisodeError",
     "EpisodeSpec",
+    "Turn",
     "TurnSpec",
     "TaskStore",
     "TaskQuery",

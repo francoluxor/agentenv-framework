@@ -96,7 +96,6 @@ def substitute_seed_in_steps(steps: list["TaskStep"], seed: dict) -> list["TaskS
     objects, so it executes exactly what the original run executed."""
     if not seed:
         return list(steps)
-    from agent_env.task_step.registry import get_task_step_registry
 
     def _sub(value):
         if isinstance(value, str):
@@ -111,11 +110,10 @@ def substitute_seed_in_steps(steps: list["TaskStep"], seed: dict) -> list["TaskS
 
     from agent_env.task_step.task_step import attach_retry_config
 
-    registry = get_task_step_registry()
     out: list["TaskStep"] = []
     for step in steps:
         data = _sub(step.to_dict())
-        out.append(attach_retry_config(registry[step.type].from_dict(data), data))
+        out.append(attach_retry_config(type(step).from_dict(data), data))
     return out
 
 

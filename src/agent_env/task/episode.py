@@ -5,20 +5,32 @@ AgentEnv runs everything else exactly as ``Task.run`` does, so the reward is the
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import uuid
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar, Optional
 
 from agent_env.entity_refs import EntityRef
+from agent_env.providers.sandbox_providers.sandbox_provider import sandbox_request_headers_for_url
+from agent_env.task.store import record_task_cancelled
 from agent_env.task.task import Task, substitute_seed_in_steps
-from agent_env.task_step.context import TaskStepContext
+from agent_env.task.teardown import teardown_run
+from agent_env.task_step.context import PromptResponse, TaskStepContext
 from agent_env.task_step.task_step import TaskStep
+from agent_env.task_step.task_steps.deploy_agent import _live_mcp_url, bound_deployment
 from agent_env.task_step.task_steps.prompt_agent import PromptAgentTaskStep
+
+logger = logging.getLogger(__name__)
 
 _AGENT_DEPLOYERS = ("install_agent", "deploy_human_agent")
 _AGENT_TARGETING = (
     "add_skills", "register_agent_triggers", "snapshot_agent_state", "load_artifact", "verify_sandbox", "run_code",
 )
+
+_live: dict[str, Episode] = {}
 
 
 class EpisodeError(ValueError):
@@ -74,6 +86,158 @@ class EpisodeSpec:
             reward_verifier_id=verifiers[0].verifier_id,
             seed=seed,
         )
+
+    async def start(self, *, run_group_id: str | None = None) -> Episode:
+        """Start one run of the task, a new episode each call. It returns once the run's record exists, before
+        anything is deployed; ``next_turn()`` is where the deploys and setup are waited for."""
+        episode_id = uuid.uuid4().hex
+        metadata: dict[str, Any] = {"episode": {"id": episode_id, "agents": list(self.agents)}}
+        if self._seed:
+            metadata["seed"] = dict(self._seed)
+        if run_group_id is not None:
+            metadata["run_group_id"] = run_group_id
+        episode = Episode(self, episode_id, TaskStepContext(metadata=metadata))
+        _live[episode_id] = episode
+        running = asyncio.Event()
+        episode._run = asyncio.create_task(episode._drive(running))
+        await running.wait()
+        return episode
+
+
+class Turn:
+    """An outside agent's turn: what it is asked, the envs it acts in and the headers each needs, until ``end()``."""
+
+    def __init__(
+        self, *, agent: str, step_id: str, prompt: str, system_prompt: str | None, role: str | None,
+        mcp_urls: dict[str, str],
+    ):
+        self.agent = agent
+        self.step_id = step_id
+        self.prompt = prompt
+        self.system_prompt = system_prompt
+        self.role = role
+        self.mcp_urls = mcp_urls
+        self.headers = {env_id: sandbox_request_headers_for_url(url) for env_id, url in mcp_urls.items()}
+        self._reply: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+
+    async def end(self, response: str | None = None) -> None:
+        """Hand the turn back, and the run carries on. No reply records an empty one, as an agent that answers with
+        nothing leaves. Once the turn is over, ended or not, this does nothing."""
+        if not self._reply.done():
+            self._reply.set_result(response or "")
+
+
+class Episode:
+    """One run of an ``EpisodeSpec``'s task, which waits at each outside turn for the caller to play it.
+
+    Cancelling a caller of ``next_turn()``, ``result()`` or ``abandon()`` cancels that call, never the run. Use an
+    episode on the event loop that started it."""
+
+    def __init__(self, spec: EpisodeSpec, id: str, context: TaskStepContext):
+        self.id = id
+        self._spec = spec
+        self._context = context
+        self._run: asyncio.Task[None]
+        self._bindings: dict[str, tuple[str | None, dict[str, str]]] = {}
+        self._waiting: deque[Turn] = deque()
+        self._turns: set[Turn] = set()
+        self._changed = asyncio.Event()
+        self._tearing_down = False
+        self._abandoned: str | None = None
+
+    async def next_turn(self) -> Turn | None:
+        """The next outside turn the run reaches, or None once the run has finished. Raises the run's error if it
+        failed first. End the turns you hold before waiting on one that depends on them."""
+        while True:
+            self._changed.clear()
+            while self._waiting and self._abandoned is None:
+                turn = self._waiting.popleft()
+                if not turn._reply.done():
+                    return turn
+            if self._run.done():
+                self._raise_unless_completed()
+                return None
+            await self._wait()
+
+    async def result(self) -> float:
+        """The reward, once the run and its teardown are over: the score of the task's one top-level verifier."""
+        while not self._run.done():
+            self._changed.clear()
+            if open_turn := next((turn for turn in self._turns if not turn._reply.done()), None):
+                raise EpisodeError(
+                    f"turn {open_turn.step_id!r} of agent {open_turn.agent!r} isn't ended, so the run can't finish"
+                )
+            await self._wait()
+        self._raise_unless_completed()
+        verifier_id = self._spec._reward_verifier_id
+        score = ((self._context.metadata.get("verifications") or {}).get(verifier_id) or {}).get("score")
+        if not isinstance(score, (int, float)):
+            raise EpisodeError(f"verifier {verifier_id!r} left no score")
+        return float(score)
+
+    async def abandon(self, reason: str) -> None:
+        """Stop the run and wait for its teardown; it is recorded cancelled with ``reason``. Once the run has
+        ended, or while it tears down, this only waits."""
+        if not (self._run.done() or self._tearing_down or self._abandoned is not None):
+            self._abandoned = reason
+            self._run.cancel(msg=reason)
+        await asyncio.wait((self._run,))
+
+    async def _drive(self, running: asyncio.Event) -> None:
+        running.set()
+        try:
+            await self._spec._copy.run(context=self._context, instance_id=self.id)
+        finally:
+            self._tearing_down = True
+            try:
+                report = await teardown_run(self._context)
+                if report.still_up:
+                    logger.warning("episode %s: %s may still be up", self.id, [s.sandbox_id for s in report.still_up])
+                if self._abandoned is not None:
+                    await asyncio.to_thread(record_task_cancelled, self.id, self._abandoned, Task._utc_now_str())
+            finally:
+                del _live[self.id]
+
+    async def _wait(self) -> None:
+        """Until a turn arrives or the run ends."""
+        changed = asyncio.ensure_future(self._changed.wait())
+        try:
+            await asyncio.wait((self._run, changed), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            changed.cancel()
+
+    def _raise_unless_completed(self) -> None:
+        if self._abandoned is not None:
+            raise EpisodeError(f"episode abandoned: {self._abandoned}")
+        if (error := self._run.exception()) is not None:
+            raise error
+
+    async def _play(self, step: _EpisodeTurnStep) -> str:
+        if step.agent_name not in self._bindings:
+            raise RuntimeError(
+                f"agent {step.agent_name!r} isn't deployed yet; turn {step.id!r} must depend on its deploy_agent step"
+            )
+        role, mcp_urls = self._bindings[step.agent_name]
+        turn = Turn(agent=step.agent_name, step_id=step.id, prompt=step.prompt, system_prompt=step.system_prompt,
+                    role=role, mcp_urls=dict(mcp_urls))
+        self._waiting.append(turn)
+        self._turns.add(turn)
+        self._changed.set()
+        try:
+            return await asyncio.wait_for(turn._reply, step.timeout_seconds)
+        except TimeoutError:
+            raise TimeoutError(
+                f"turn {step.id!r} of agent {step.agent_name!r} wasn't ended within {step.timeout_seconds}s"
+            ) from None
+        finally:
+            self._turns.discard(turn)
+
+
+def _episode_of(context: TaskStepContext) -> Episode:
+    episode = _live.get((context.metadata.get("episode") or {}).get("id"))
+    if episode is None:
+        raise RuntimeError("episode_agent and episode_turn steps run only in the run of an episode")
+    return episode
 
 
 def _outside_agents(task: Task, steps: list[TaskStep], agents: Sequence[str] | None) -> list[str]:
@@ -217,7 +381,12 @@ class _EpisodeAgentStep(TaskStep):
                    env_step_id=data["env_step_id"], role=data["role"])
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
-        raise NotImplementedError
+        mcp_urls = {}
+        for env_id in self.env_ids:
+            deployed = bound_deployment(context, env_id, self)
+            mcp_urls[env_id] = deployed.mcp_url if deployed is not None else _live_mcp_url(env_id)
+        _episode_of(context)._bindings[self.agent_name] = (self.role, mcp_urls)
+        return context
 
 
 class _EpisodeTurnStep(TaskStep):
@@ -249,4 +418,9 @@ class _EpisodeTurnStep(TaskStep):
                    timeout_seconds=data["timeout_seconds"])
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
-        raise NotImplementedError
+        reply = await _episode_of(context)._play(self)
+        context.prompt_responses.append(PromptResponse(
+            prompt_id=self.prompt_id, response=reply, prompt_text=self.prompt, agent_name=self.agent_name,
+            step_id=self.id,
+        ))
+        return context

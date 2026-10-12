@@ -100,6 +100,34 @@ def _live_mcp_url(env_id: str) -> str:
     return url.strip()
 
 
+def _deploy_step_of(deployed_env: DeployedEnv) -> Optional[str]:
+    return (deployed_env.metadata or {}).get("deploy_step_id")
+
+
+def bound_deployment(context: TaskStepContext, env_id: str, step: TaskStep) -> Optional[DeployedEnv]:
+    """The deployment of `env_id` the agent `step` deploys is bound to, by its `env_step_id`, or None if it isn't
+    deployed here."""
+    env_step_id = step.env_step_id
+    matches = [d for d in context.deployed_envs if d.env_id == env_id]
+    if env_step_id is not None:
+        # A filter, not a hint: an unmatched id is an error, never a substitute.
+        # Envs with no deployments fall through to the caller's live-endpoint path.
+        named = [d for d in matches if _deploy_step_of(d) == env_step_id]
+        if matches and not named:
+            raise RuntimeError(
+                f"deploy_agent '{step.id}': env_step_id '{env_step_id}' names no deployment of "
+                f"env '{env_id}' (deployed by: {[_deploy_step_of(d) for d in matches]})"
+            )
+        matches = named
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"deploy_agent '{step.id}': {len(matches)} deployments of env '{env_id}' "
+            f"(deployed by: {[_deploy_step_of(d) for d in matches]}). Set env_step_id "
+            "to the deploy_env step this agent should bind to."
+        )
+    return matches[0] if matches else None
+
+
 def _skill_fields(skill: dict) -> dict:
     """A ``skills`` entry as ``A2AAgent.register_skill`` arguments. ``content`` is an older name for
     ``skill_md``, and ``skill_s3_url`` and ``s3_uri`` for ``object_url``; ``skill_md`` is sent verbatim."""
@@ -276,7 +304,7 @@ class DeployAgentTaskStep(TaskStep):
         )
 
         # Resolved before anything is provisioned so an unbound env fails before a sandbox exists.
-        env_deployments = {env_id: self._deployed_env(context, env_id) for env_id in self.env_ids}
+        env_deployments = {env_id: bound_deployment(context, env_id, self) for env_id in self.env_ids}
 
         existing = next((a for a in context.deployed_agents if a.agent_name == self.agent_name), None)
         if existing is not None:
@@ -455,31 +483,6 @@ class DeployAgentTaskStep(TaskStep):
             network_policy=deployed.network_policy,
         ))
         return context
-
-    @staticmethod
-    def _deploy_step_of(deployed_env: DeployedEnv) -> Optional[str]:
-        return (deployed_env.metadata or {}).get("deploy_step_id")
-
-    def _deployed_env(self, context: TaskStepContext, env_id: str) -> Optional[DeployedEnv]:
-        """The deployment of `env_id` this step is bound to, or None if it isn't deployed here."""
-        matches = [d for d in context.deployed_envs if d.env_id == env_id]
-        if self.env_step_id is not None:
-            # A filter, not a hint: an unmatched id is an error, never a substitute.
-            # Envs with no deployments fall through to the caller's live-endpoint path.
-            named = [d for d in matches if self._deploy_step_of(d) == self.env_step_id]
-            if matches and not named:
-                raise RuntimeError(
-                    f"deploy_agent '{self.id}': env_step_id '{self.env_step_id}' names no deployment of "
-                    f"env '{env_id}' (deployed by: {[self._deploy_step_of(d) for d in matches]})"
-                )
-            matches = named
-        if len(matches) > 1:
-            raise RuntimeError(
-                f"deploy_agent '{self.id}': {len(matches)} deployments of env '{env_id}' "
-                f"(deployed by: {[self._deploy_step_of(d) for d in matches]}). Set env_step_id "
-                "to the deploy_env step this agent should bind to."
-            )
-        return matches[0] if matches else None
 
     def _resolved_ttl_seconds(self, context: TaskStepContext) -> int:
         override = context.metadata.get("user_overrides", {}).get("ttl_seconds")
