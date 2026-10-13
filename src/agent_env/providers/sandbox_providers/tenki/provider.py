@@ -13,6 +13,7 @@ import logging
 import math
 import re
 import uuid
+import weakref
 from datetime import UTC, datetime
 from typing import Any, ClassVar, Self
 from urllib.parse import urlparse
@@ -23,7 +24,7 @@ from agent_env.attribution import Attribution
 from agent_env.config.errors import ConfigError
 from agent_env.providers.sandbox_providers.sandbox import NetworkPolicy, NetworkPolicyUnsupportedError
 from agent_env.providers.sandbox_providers.sandbox_provider import SandboxProvider, apply_default_attribution
-from agent_env.providers.sandbox_providers.tenki.sandbox import TenkiSandbox, policy_from_info
+from agent_env.providers.sandbox_providers.tenki.sandbox import ENDED_STATES, TenkiSandbox, policy_from_info
 
 logger = logging.getLogger(__name__)
 
@@ -144,9 +145,22 @@ async def _reap(sandbox: TenkiSandbox) -> None:
         logger.error("Tenki VM %s from a failed create is still running; it stops at its max lifetime",
                      sandbox.sandbox_id)
         with contextlib.suppress(Exception):
-            await sandbox.close_client()
+            await sandbox.release()
     if cancelled:
         raise asyncio.CancelledError
+
+
+async def _reclaim_by_name(client: Any, name: str, policy: NetworkPolicy, timeout: int) -> None:
+    """Terminate the VM a failed create may have made anyway, its response lost: the active session tagged
+    ``agentenv`` with the create's unique name."""
+    try:
+        sessions = await client.list(tags=[SESSION_TAG])
+    except Exception as exc:  # noqa: BLE001 - best effort; the VM still stops at its max lifetime
+        logger.warning("Could not look for a Tenki VM %s left by a failed create: %s", name, exc)
+        return
+    for session in sessions:
+        if session.info.name == name and session.info.state not in ENDED_STATES:
+            await _reap(TenkiSandbox(session, tunnel_urls={}, network_policy=policy, command_timeout=timeout))
 
 
 def _spawn(cleanup: Any) -> asyncio.Task:
@@ -188,6 +202,9 @@ class TenkiSandboxProvider(SandboxProvider):
         self._min_disk_gb = min_disk_gb
         # Injectable so unit tests never build an SDK client.
         self._client_cls = client_cls
+        # One client per event loop, shared by every sandbox this provider creates or reconnects to: an SDK client
+        # holds a gRPC channel bound to the loop it was made in, and the CLI runs several loops in one process.
+        self._clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any] = weakref.WeakKeyDictionary()
 
     @classmethod
     def from_config(cls, **config: Any) -> Self:
@@ -230,7 +247,11 @@ class TenkiSandboxProvider(SandboxProvider):
         )
 
     def _client(self) -> Any:
-        return self._client_cls(api_key=self._api_key, base_url=self._base_url)
+        loop = asyncio.get_running_loop()
+        client = self._clients.get(loop)
+        if client is None:
+            client = self._clients[loop] = self._client_cls(api_key=self._api_key, base_url=self._base_url)
+        return client
 
     async def create_vm(
         self,
@@ -287,9 +308,7 @@ class TenkiSandboxProvider(SandboxProvider):
 
         client = self._client()
         session = await self._create_or_reclaim(client, create_kwargs, effective_policy, timeout)
-        sandbox = TenkiSandbox(
-            session, client=client, tunnel_urls={}, network_policy=effective_policy, command_timeout=timeout,
-        )
+        sandbox = TenkiSandbox(session, tunnel_urls={}, network_policy=effective_policy, command_timeout=timeout)
         try:
             await session.wait_ready(timeout=READY_TIMEOUT_SEC)
             granted = _remaining_lifetime(session.info.timeout_at) if session.info.timeout_at else timeout
@@ -320,27 +339,28 @@ class TenkiSandboxProvider(SandboxProvider):
     async def _create_or_reclaim(
         client: Any, create_kwargs: dict[str, Any], policy: NetworkPolicy, timeout: int
     ) -> Any:
-        """Await the create, closing ``client`` if it fails. If the caller is cancelled first, the create's outcome
-        owns ``client``: the VM it yields is terminated, which would otherwise run with no handle until its max
-        lifetime, and that closes the client; a create that fails closes it directly."""
+        """Await the create. A VM that would otherwise run with no handle until its max lifetime is terminated: the
+        one a create yields after its caller was cancelled, and the one a create that failed may have made anyway,
+        its response lost, which is found by its unique name."""
         task = asyncio.ensure_future(client.create(**create_kwargs))
 
         def terminate_orphan(done: asyncio.Future) -> None:
-            if done.cancelled() or done.exception() is not None:
-                cleanup = client.close()
+            if done.cancelled():
+                return
+            if done.exception() is not None:
+                _spawn(_reclaim_by_name(client, create_kwargs["name"], policy, timeout))
             else:
-                cleanup = _reap(TenkiSandbox(
-                    done.result(), client=client, tunnel_urls={}, network_policy=policy, command_timeout=timeout,
-                ))
-            _spawn(cleanup)
+                _spawn(_reap(TenkiSandbox(done.result(), tunnel_urls={}, network_policy=policy,
+                                          command_timeout=timeout)))
 
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
             task.add_done_callback(terminate_orphan)
             raise
-        except BaseException:
-            await client.close()
+        except Exception:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(_spawn(_reclaim_by_name(client, create_kwargs["name"], policy, timeout)))
             raise
 
     @staticmethod
@@ -375,17 +395,11 @@ class TenkiSandboxProvider(SandboxProvider):
 
     async def get_sandbox(self, sandbox_id: str) -> TenkiSandbox:
         """Reconnect, restoring the exposed ports and the applied egress policy."""
-        client = self._client()
-        try:
-            session = await client.get(sandbox_id)
-            exposed = await session.list_exposed_ports()
-        except BaseException:
-            await client.close()
-            raise
+        session = await self._client().get(sandbox_id)
+        exposed = await session.list_exposed_ports()
         info = session.info
         return TenkiSandbox(
             session,
-            client=client,
             tunnel_urls={item.port: _tunnel_url(item.url) for item in exposed},
             network_policy=policy_from_info(info),
             command_timeout=_remaining_lifetime(info.timeout_at),

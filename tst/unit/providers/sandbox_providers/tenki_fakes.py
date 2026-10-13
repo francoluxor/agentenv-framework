@@ -13,6 +13,7 @@ from tenki_sandbox.models import CommandResult, ExposedPort, SessionEgressPolicy
 @dataclass
 class FakeInfo:
     id: str
+    name: str = ""
     state: str = "CREATING"
     outbound_enabled: bool = True
     egress: SessionEgressPolicy = field(default_factory=SessionEgressPolicy)
@@ -118,6 +119,8 @@ class FakeClient:
         self.closed = False
         self.create_delay = 0.0
         self.create_error: BaseException | None = None
+        # The server made the VM but the response was lost: create records the session, then raises create_error.
+        self.create_commits = False
         self.next_session: FakeSession | None = None
         type(self).instances.append(self)
         if type(self).on_init is not None:
@@ -127,11 +130,17 @@ class FakeClient:
         self.create_calls.append(kwargs)
         if self.create_delay:
             await asyncio.sleep(self.create_delay)
+        session = self.next_session or FakeSession()
+        session.info.name = kwargs.get("name", "")
+        if self.create_error is not None and not self.create_commits:
+            raise self.create_error
+        self.sessions[session.id] = session
         if self.create_error is not None:
             raise self.create_error
-        session = self.next_session or FakeSession()
-        self.sessions[session.id] = session
         return session
+
+    async def list(self, tags: list[str] | None = None) -> list[FakeSession]:
+        return list(self.sessions.values())
 
     async def get(self, sandbox_id: str) -> FakeSession:
         return self.sessions[sandbox_id]

@@ -61,7 +61,7 @@ exit 1
 """
 
 BOOTSTRAP_TIMEOUT_SEC = 900
-_ENDED_STATES = frozenset({"TERMINATING", "TERMINATED", "GONE"})
+ENDED_STATES = frozenset({"TERMINATING", "TERMINATED", "GONE"})
 # What exec returns when the stream drops without an exit status; exec_script retries only this.
 _UNKNOWN_EXIT_CODE = -1
 _TIMED_OUT_EXIT_CODE = 124
@@ -150,7 +150,7 @@ class _CompletedProcess:
 
 
 class TenkiSandbox(VmSandbox):
-    """A Tenki VM with Docker. ``client`` is the Tenki client this handle owns and closes on terminate.
+    """A Tenki VM with Docker; its client is its provider's, shared with the provider's other sandboxes.
     ``command_timeout`` is every command's execution budget, normally the VM's remaining lifetime: Tenki bounds a
     command that declares none to one hour."""
 
@@ -161,13 +161,11 @@ class TenkiSandbox(VmSandbox):
         self,
         session: Any,
         *,
-        client: Any | None,
         tunnel_urls: dict[int, str],
         network_policy: NetworkPolicy | None,
         command_timeout: int,
     ):
         self._session = session
-        self._client = client
         self.command_timeout = command_timeout
         self.sandbox_id = session.id
         self.mode = SANDBOX_MODE_VM
@@ -177,27 +175,23 @@ class TenkiSandbox(VmSandbox):
 
     async def terminate(self) -> None:
         """Terminate the VM. One another handle already terminated, while this handle's cached state still says
-        running, is not an error. The client is closed only once the session is ended, so a failed or cancelled
-        attempt leaves this handle able to retry."""
+        running, is not an error."""
         try:
             await self._session.close_if_open()
         except SessionNotFoundError:
             logger.info("Tenki session %s was already gone at terminate", self.sandbox_id)
         except (InvalidStateError, SessionTerminatedError):
-            if await self._current_state() not in _ENDED_STATES:
+            if await self._current_state() not in ENDED_STATES:
                 raise
             logger.info("Tenki session %s was already terminating at terminate", self.sandbox_id)
-        await self.close_client()
+        await self.release()
 
-    async def close_client(self) -> None:
-        """Stop the session's data-plane credential renewal and close the client this handle owns. The SDK's
-        close_if_open skips that renewal for a session it already sees ending, which then outlives the client."""
+    async def release(self) -> None:
+        """Stop the session's data-plane credential renewal, which the SDK's close_if_open skips for a session it
+        already sees ending and which would otherwise retry for the life of the process."""
         reset = getattr(self._session, "_reset_data_plane", None)
         if reset is not None:
             await reset()
-        client, self._client = self._client, None
-        if client is not None:
-            await client.close()
 
     async def _current_state(self) -> str:
         try:

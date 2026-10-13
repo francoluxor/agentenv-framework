@@ -152,11 +152,11 @@ async def test_workspace_preview_domains_join_later_allowlists(client_cls):
     env = await provider.create_vm(setup_for_gateway=False, exposed_ports=[8080])
     assert env.tunnel_urls[8080] == "https://p8080-env-1.acme.us.sb.tenki.sh"
 
-    client_cls.on_init = None
+    client_cls.instances[0].next_session = None
     await provider.create_vm(
         setup_for_gateway=False, network_policy=NetworkPolicy(mode=ALLOWLIST, allow_hosts=("a.io",)),
     )
-    assert "*.acme.us.sb.tenki.sh" in client_cls.instances[-1].create_calls[0]["allow_domains"]
+    assert "*.acme.us.sb.tenki.sh" in client_cls.instances[0].create_calls[-1]["allow_domains"]
 
 
 @pytest.mark.parametrize(("url", "learned"), [
@@ -178,7 +178,8 @@ def test_learned_preview_parents_are_capped():
 
 
 def test_a_malformed_cidr_is_unsupported_rather_than_an_error():
-    assert not TenkiSandboxProvider.supports_network_policy(NetworkPolicy(mode=ALLOWLIST, allow_cidrs=("10.0.0.300/8",)))
+    policy = NetworkPolicy(mode=ALLOWLIST, allow_cidrs=("10.0.0.300/8",))
+    assert not TenkiSandboxProvider.supports_network_policy(policy)
 
 
 def test_cidrs_are_normalized():
@@ -195,25 +196,41 @@ async def test_a_lifetime_tenki_capped_becomes_the_command_budget(client_cls, ca
 
 
 @pytest.mark.asyncio
-async def test_a_reaper_that_gives_up_closes_the_client(monkeypatch):
-    slept = []
+async def test_a_reaper_that_gives_up_stops_the_sessions_renewal_without_a_last_sleep(monkeypatch):
+    slept, released = [], []
 
     async def no_sleep(seconds):
         slept.append(seconds)
 
+    async def reset():
+        released.append(True)
+
     monkeypatch.setattr(provider_module.asyncio, "sleep", no_sleep)
-    session, client = FakeSession(state="RUNNING"), fake_client_cls()()
+    session = FakeSession(state="RUNNING")
     session.close_error = SandboxError("unavailable")
-    await provider_module._reap(TenkiSandbox(session, client=client, tunnel_urls={}, network_policy=NetworkPolicy(),
-                                             command_timeout=60))
+    session._reset_data_plane = reset
+    sandbox = TenkiSandbox(session, tunnel_urls={}, network_policy=NetworkPolicy(), command_timeout=60)
+    await provider_module._reap(sandbox)
     assert slept == [1, 2]
-    assert client.closed
+    assert released == [True]
+
+
+@pytest.mark.asyncio
+async def test_every_sandbox_of_a_provider_shares_one_client_per_event_loop(client_cls):
+    provider = _provider(client_cls)
+    created = await provider.create_vm(setup_for_gateway=False)
+    await provider.get_sandbox(created.sandbox_id)
+    await created.terminate()
+    assert len(client_cls.instances) == 1
+    assert not client_cls.instances[0].closed
 
 
 @pytest.mark.asyncio
 async def test_create_vm_refuses_an_unenforceable_policy_before_creating(client_cls):
     with pytest.raises(NetworkPolicyUnsupportedError):
-        await _provider(client_cls).create_vm(network_policy=NetworkPolicy(mode=ALLOWLIST, allow_cidrs=("2001:db8::/32",)))
+        await _provider(client_cls).create_vm(
+            network_policy=NetworkPolicy(mode=ALLOWLIST, allow_cidrs=("2001:db8::/32",)),
+        )
     assert client_cls.instances == []
 
 
@@ -235,14 +252,13 @@ async def test_create_vm_readies_docker_for_the_gateway_as_root(client_cls):
 
 
 @pytest.mark.asyncio
-async def test_a_setup_failure_terminates_the_vm_and_closes_the_client(client_cls):
+async def test_a_setup_failure_terminates_the_vm(client_cls):
     session = FakeSession()
     session.results = [result(stderr=b"no space left", exit_code=1)]
     client_cls.on_init = lambda client: setattr(client, "next_session", session)
     with pytest.raises(RuntimeError, match="no space left"):
         await _provider(client_cls).create_vm()
     assert session.closed == 1
-    assert client_cls.instances[0].closed
 
 
 @pytest.mark.asyncio
@@ -257,7 +273,6 @@ async def test_a_create_cancelled_while_the_vm_boots_still_terminates_it(client_
         await task
     await asyncio.sleep(0.05)
     assert session.closed == 1
-    assert client_cls.instances[0].closed
 
 
 @pytest.mark.asyncio
@@ -268,35 +283,45 @@ async def test_a_cancelled_create_reaps_the_vm(client_cls):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    client = client_cls.instances[0]
-    assert not client.closed, "the reaper still needs the client to terminate the VM"
     await asyncio.sleep(0.1)
-    assert client.sessions["sess-1"].closed == 1
-    assert client.closed
+    assert client_cls.instances[0].sessions["sess-1"].closed == 1
+
+
+def _lost_response(client):
+    client.create_error = SandboxError("connection reset")
+    client.create_commits = True
 
 
 @pytest.mark.asyncio
-async def test_a_cancelled_create_that_then_fails_still_closes_the_client(client_cls):
-    def failing_slow_create(client):
-        client.create_delay = 0.05
-        client.create_error = RuntimeError("capacity unavailable")
+async def test_a_create_whose_response_was_lost_terminates_the_vm_it_made(client_cls):
+    client_cls.on_init = _lost_response
+    with pytest.raises(SandboxError, match="connection reset"):
+        await _provider(client_cls).create_vm(setup_for_gateway=False)
+    assert client_cls.instances[0].sessions["sess-1"].closed == 1
 
-    client_cls.on_init = failing_slow_create
+
+@pytest.mark.asyncio
+async def test_a_cancelled_create_whose_response_was_lost_terminates_the_vm_it_made(client_cls):
+    def slow_lost_response(client):
+        _lost_response(client)
+        client.create_delay = 0.05
+
+    client_cls.on_init = slow_lost_response
     task = asyncio.ensure_future(_provider(client_cls).create_vm(setup_for_gateway=False))
     await asyncio.sleep(0.01)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     await asyncio.sleep(0.1)
-    assert client_cls.instances[0].closed
+    assert client_cls.instances[0].sessions["sess-1"].closed == 1
 
 
 @pytest.mark.asyncio
-async def test_a_failed_create_closes_the_client(client_cls):
-    client_cls.on_init = lambda client: setattr(client, "create_error", RuntimeError("capacity unavailable"))
-    with pytest.raises(RuntimeError, match="capacity unavailable"):
+async def test_a_create_rejected_outright_leaves_nothing_to_reclaim(client_cls):
+    client_cls.on_init = lambda client: setattr(client, "create_error", SandboxError("quota exceeded"))
+    with pytest.raises(SandboxError, match="quota exceeded"):
         await _provider(client_cls).create_vm(setup_for_gateway=False)
-    assert client_cls.instances[0].closed
+    assert client_cls.instances[0].sessions == {}
 
 
 @pytest.mark.asyncio
@@ -317,7 +342,7 @@ async def test_get_sandbox_restores_ports_policy_and_lifetime(client_cls):
     client_cls.on_init = lambda client: client.sessions.update({"sess-9": session})
     sandbox = await _provider(client_cls).get_sandbox("sess-9")
     assert sandbox.tunnel_urls == {8080: "https://p8080.sb.tenki.sh"}
-    assert sandbox.network_policy == NetworkPolicy(mode=ALLOWLIST, allow_hosts=("pypi.org",), allow_cidrs=("10.0.0.0/8",))
+    assert sandbox.network_policy == NetworkPolicy(
+        mode=ALLOWLIST, allow_hosts=("pypi.org",), allow_cidrs=("10.0.0.0/8",),
+    )
     assert 1700 <= sandbox.command_timeout <= 1800
-    await sandbox.terminate()
-    assert client_cls.instances[0].closed

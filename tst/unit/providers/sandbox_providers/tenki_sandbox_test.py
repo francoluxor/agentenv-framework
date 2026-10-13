@@ -12,14 +12,14 @@ from tenki_sandbox.models import SessionEgressPolicy
 from agent_env.providers.sandbox_providers.sandbox import NetworkMode, NetworkPolicy
 from agent_env.providers.sandbox_providers.tenki import sandbox as sandbox_module
 from agent_env.providers.sandbox_providers.tenki.sandbox import TenkiSandbox, allows_host, policy_from_info
-from tst.unit.providers.sandbox_providers.tenki_fakes import FakeSession, fake_client_cls, result
+from tst.unit.providers.sandbox_providers.tenki_fakes import FakeSession, result
 
 ALLOWLIST = NetworkMode.ALLOWLIST
 
 
-def _sandbox(session: FakeSession | None = None, *, policy=NetworkPolicy(), client=None) -> TenkiSandbox:
+def _sandbox(session: FakeSession | None = None, *, policy=NetworkPolicy()) -> TenkiSandbox:
     return TenkiSandbox(
-        session or FakeSession(state="RUNNING"), client=client, tunnel_urls={}, network_policy=policy,
+        session or FakeSession(state="RUNNING"), tunnel_urls={}, network_policy=policy,
         command_timeout=600,
     )
 
@@ -188,17 +188,16 @@ async def test_stdin_stops_reading_once_the_command_ended(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_close_client_stops_the_data_plane_renewal_first():
+async def test_terminate_stops_the_data_plane_renewal_of_a_session_already_ending():
     calls = []
-    session, client = FakeSession(state="TERMINATING"), fake_client_cls()()
+    session = FakeSession(state="TERMINATING")
 
     async def reset():
         calls.append("reset")
 
     session._reset_data_plane = reset
-    await _sandbox(session, client=client).terminate()
+    await _sandbox(session).terminate()
     assert calls == ["reset"]
-    assert client.closed
 
 
 def _stalled_process(*, error: BaseException | None) -> SimpleNamespace:
@@ -232,27 +231,24 @@ async def test_write_host_file_goes_over_stdin_to_any_path():
 
 
 @pytest.mark.asyncio
-async def test_terminate_closes_the_session_and_the_owned_client_once():
-    session, client = FakeSession(state="RUNNING"), fake_client_cls()()
-    sandbox = _sandbox(session, client=client)
+async def test_terminate_closes_the_session_once():
+    session = FakeSession(state="RUNNING")
+    sandbox = _sandbox(session)
     await sandbox.terminate()
     await sandbox.terminate()
     assert session.closed == 1
-    assert client.closed
 
 
 @pytest.mark.asyncio
-async def test_a_failed_terminate_keeps_the_client_so_a_retry_can_succeed():
-    session, client = FakeSession(state="RUNNING"), fake_client_cls()()
+async def test_a_failed_terminate_can_be_retried():
+    session = FakeSession(state="RUNNING")
     session.close_error = SandboxError("unavailable")
-    sandbox = _sandbox(session, client=client)
+    sandbox = _sandbox(session)
     with pytest.raises(SandboxError):
         await sandbox.terminate()
-    assert not client.closed
     session.close_error = None
     await sandbox.terminate()
     assert session.closed == 1
-    assert client.closed
 
 
 @pytest.mark.asyncio
@@ -278,9 +274,7 @@ class _TerminatedElsewhere(FakeSession):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("server_state", ["TERMINATING", "TERMINATED"])
 async def test_terminate_tolerates_a_session_another_handle_terminated(server_state):
-    client = fake_client_cls()()
-    await _sandbox(_TerminatedElsewhere(server_state), client=client).terminate()
-    assert client.closed
+    await _sandbox(_TerminatedElsewhere(server_state)).terminate()
 
 
 @pytest.mark.asyncio
