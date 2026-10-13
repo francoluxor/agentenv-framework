@@ -196,6 +196,43 @@ async def test_a_lifetime_tenki_capped_becomes_the_command_budget(client_cls, ca
 
 
 @pytest.mark.asyncio
+async def test_a_lifetime_shortened_only_by_the_boot_is_not_a_cap(client_cls, caplog):
+    session = FakeSession(timeout_at=datetime.now(UTC) + timedelta(seconds=3 * 3600 - 20))
+    client_cls.on_init = lambda client: setattr(client, "next_session", session)
+    sandbox = await _provider(client_cls).create_vm(timeout=3 * 3600, setup_for_gateway=False)
+    assert sandbox.command_timeout == 3 * 3600
+    assert "capped" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_create_cancelled_by_itself_still_reclaims_the_vm_it_made(client_cls):
+    def cancelled_after_commit(client):
+        client.create_error = asyncio.CancelledError()
+        client.create_commits = True
+
+    client_cls.on_init = cancelled_after_commit
+    with pytest.raises(asyncio.CancelledError):
+        await _provider(client_cls).create_vm(setup_for_gateway=False)
+    await asyncio.sleep(0.05)
+    assert client_cls.instances[0].sessions["sess-1"].closed == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_create_while_it_cleans_up_raises_the_cancellation(client_cls):
+    session = FakeSession()
+    session.results = [result(stderr=b"no space left", exit_code=1)]
+    session.close_delay = 0.1
+    client_cls.on_init = lambda client: setattr(client, "next_session", session)
+    task = asyncio.ensure_future(_provider(client_cls).create_vm())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.15)
+    assert session.closed == 1
+
+
+@pytest.mark.asyncio
 async def test_a_reaper_that_gives_up_stops_the_sessions_renewal_without_a_last_sleep(monkeypatch):
     slept, released = [], []
 

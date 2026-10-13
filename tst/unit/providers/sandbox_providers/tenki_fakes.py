@@ -60,6 +60,7 @@ class FakeSession:
         self.closed = 0
         self.close_error: BaseException | None = None
         self.ready_delay = 0.0
+        self.close_delay = 0.0
         self.preview_parent = "sb.tenki.sh"
 
     @property
@@ -100,6 +101,8 @@ class FakeSession:
     async def close_if_open(self) -> None:
         if self.state in {"TERMINATING", "TERMINATED"}:
             return
+        if self.close_delay:
+            await asyncio.sleep(self.close_delay)
         if self.close_error is not None:
             raise self.close_error
         self.closed += 1

@@ -248,12 +248,18 @@ class TenkiSandbox(VmSandbox):
     @staticmethod
     async def _reap(process: Any) -> None:
         """Close stdin, kill and wait for a process whose input failed, so the remote command and the SDK stream end
-        now rather than at the command's timeout. Its own failures are logged, never raised over the original one."""
+        now rather than at the command's timeout. Its own failures are logged, never raised over the original one; a
+        cancellation is honored once every step has run."""
+        cancelled = False
         for step in (process.close_stdin, process.kill, lambda: process.wait(timeout=_REAP_TIMEOUT_SEC)):
             try:
                 await step()
+            except asyncio.CancelledError:
+                cancelled = True
             except Exception as exc:  # noqa: BLE001 - the input's failure is the one to report
                 logger.debug("Reaping a failed stdin exec: %s: %s", type(exc).__name__, exc)
+        if cancelled:
+            raise asyncio.CancelledError
 
     @staticmethod
     async def _wait_for_stdin_drain(process: Any) -> bool:

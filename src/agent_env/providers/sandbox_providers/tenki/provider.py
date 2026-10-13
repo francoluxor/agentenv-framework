@@ -49,6 +49,8 @@ MAX_ALLOW_DOMAINS = 256
 MAX_ALLOW_CIDRS = 64
 
 READY_TIMEOUT_SEC = 300
+# Clock skew and rounding between this machine and Tenki, below which a shorter lifetime isn't a cap.
+_LIFETIME_SLACK_SEC = 60
 _REAP_ATTEMPTS = 3
 _reapers: set[asyncio.Task] = set()
 
@@ -113,6 +115,15 @@ def _tunnel_url(url: str) -> str:
             and len(_preview_parents) < _MAX_PREVIEW_PARENTS):
         _preview_parents.add(entry)
     return url
+
+
+def _granted_lifetime(timeout_at: datetime | None, requested_at: datetime) -> float:
+    """The lifetime Tenki gave a VM requested at ``requested_at``, boot included; infinite when it reports none."""
+    if timeout_at is None:
+        return math.inf
+    if timeout_at.tzinfo is None:
+        timeout_at = timeout_at.replace(tzinfo=UTC)
+    return (timeout_at - requested_at).total_seconds()
 
 
 def _remaining_lifetime(timeout_at: datetime | None) -> int:
@@ -307,17 +318,17 @@ class TenkiSandboxProvider(SandboxProvider):
             create_kwargs["snapshot_id"] = self._snapshot_id
 
         client = self._client()
+        requested_at = datetime.now(UTC)
         session = await self._create_or_reclaim(client, create_kwargs, effective_policy, timeout)
         sandbox = TenkiSandbox(session, tunnel_urls={}, network_policy=effective_policy, command_timeout=timeout)
         try:
             await session.wait_ready(timeout=READY_TIMEOUT_SEC)
-            granted = _remaining_lifetime(session.info.timeout_at) if session.info.timeout_at else timeout
-            if granted < timeout:
+            if (granted := _granted_lifetime(session.info.timeout_at, requested_at)) < timeout - _LIFETIME_SLACK_SEC:
                 logger.warning(
                     "Tenki capped VM %s's lifetime to %ss of the %ss requested: the workspace's maximum session "
                     "duration is lower", session.id, granted, timeout,
                 )
-                sandbox.command_timeout = granted
+                sandbox.command_timeout = _remaining_lifetime(session.info.timeout_at)
             sandbox.tunnel_urls = await self._expose(session, ports)
             logger.info(
                 "Tenki VM started: session_id=%s cpu=%s memory=%sMB disk=%sGB ports=%s attribution=%s",
@@ -331,8 +342,8 @@ class TenkiSandboxProvider(SandboxProvider):
             # cancellation leaves it running. The create's own error is the one raised.
             reaper = _spawn(_reap(sandbox))
             if not isinstance(error, asyncio.CancelledError):
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.shield(reaper)
+                # A cancellation while waiting propagates; the reaper keeps running on its own.
+                await asyncio.shield(reaper)
             raise
 
     @staticmethod
@@ -345,9 +356,8 @@ class TenkiSandboxProvider(SandboxProvider):
         task = asyncio.ensure_future(client.create(**create_kwargs))
 
         def terminate_orphan(done: asyncio.Future) -> None:
-            if done.cancelled():
-                return
-            if done.exception() is not None:
+            # A create cancelled itself, as the loop's shutdown cancels it, may have made its VM all the same.
+            if done.cancelled() or done.exception() is not None:
                 _spawn(_reclaim_by_name(client, create_kwargs["name"], policy, timeout))
             else:
                 _spawn(_reap(TenkiSandbox(done.result(), tunnel_urls={}, network_policy=policy,
@@ -359,8 +369,7 @@ class TenkiSandboxProvider(SandboxProvider):
             task.add_done_callback(terminate_orphan)
             raise
         except Exception:
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.shield(_spawn(_reclaim_by_name(client, create_kwargs["name"], policy, timeout)))
+            await asyncio.shield(_spawn(_reclaim_by_name(client, create_kwargs["name"], policy, timeout)))
             raise
 
     @staticmethod

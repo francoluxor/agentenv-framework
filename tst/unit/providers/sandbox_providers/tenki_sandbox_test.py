@@ -147,6 +147,24 @@ async def test_a_wait_that_fails_reaps_the_process():
 
 
 @pytest.mark.asyncio
+async def test_a_reap_that_is_cancelled_still_kills_and_waits():
+    calls = []
+
+    async def cancelled():
+        calls.append("close_stdin")
+        raise asyncio.CancelledError
+
+    async def record(name):
+        calls.append(name)
+
+    process = SimpleNamespace(close_stdin=cancelled, kill=lambda: record("kill"),
+                              wait=lambda timeout=None: record("wait"))
+    with pytest.raises(asyncio.CancelledError):
+        await TenkiSandbox._reap(process)
+    assert calls == ["close_stdin", "kill", "wait"]
+
+
+@pytest.mark.asyncio
 async def test_a_failing_reap_does_not_mask_the_input_error():
     session = FakeSession()
 
