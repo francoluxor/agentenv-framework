@@ -1,9 +1,9 @@
 # `tenki` sandbox provider
 
 Runs agent-env sandboxes on [Tenki Sandbox](https://tenki.cloud/docs/sandbox) VMs. Each environment and each agent
-gets its own Linux VM, with Docker inside and public HTTPS URLs for its ports. Like `modal_vm`, `e2b` and `sail_vm`,
-it is a VM provider: agent-env's docker-in-VM flows run on it unchanged. That covers the gateway's docker-compose, an
-agent's `docker run`, image loading and artifact collection.
+gets its own Linux VM, with Docker inside and public HTTPS URLs for its ports. Like `modal_vm`, `e2b`, `sail_vm` and
+`tensorlake`, it is a VM provider: agent-env's docker-in-VM flows run on it unchanged. That covers the gateway's
+docker-compose, an agent's `docker run`, image loading and artifact collection.
 
 ## Set up
 
@@ -26,11 +26,12 @@ export TENKI_API_KEY=tk_...
 ```
 
 For a shared deployment, put it in your secret store instead, for example as `tenki_api_key`, and reference it with
-`secret:tenki_api_key`. Never put the key itself in `config.toml`.
+`secret:tenki_api_key`. Never put the key itself in `config.toml`. The provider reads the key only from its config,
+never from the process environment.
 
 ### 3. Configure
 
-A `.agentenv/config.toml` that runs every environment and agent on Tenki, with the local stores:
+A complete `.agentenv/config.toml` that runs every environment and agent on Tenki, with the local stores:
 
 ```toml
 [sandbox]
@@ -39,10 +40,15 @@ agent_default = "tenki"   # agents
 
 [sandbox.providers.tenki.config]
 api_key = "env:TENKI_API_KEY"   # or "secret:tenki_api_key"
+
+[model]
+base_url = "https://litellm.example.com"
+api_key  = "env:LITELLM_API_KEY"
 ```
 
 To keep the local default and use Tenki per run instead, add only the `[sandbox.providers.tenki.config]` table and
 pass `--sandbox tenki`, or `--env-sandbox tenki` / `--agent-sandbox tenki` on `agent-env task run`.
+`agent-env config show` prints the file in effect and masks the key.
 
 ### 4. Run something
 
@@ -52,13 +58,16 @@ The bundled `hello` task deploys a sandbox, loads a file into it and checks it, 
 agent-env run hello --sandbox tenki
 ```
 
-## Configuration
+`agent-env -v run …` also logs each VM as it starts
+(`Tenki VM started: session_id=… cpu=… memory=…MB disk=…GB ports=… attribution=…`).
 
-Every key goes under `[sandbox.providers.tenki.config]`. Unknown keys are refused.
+## Configuration reference
+
+All keys go under `[sandbox.providers.tenki.config]`. Unknown keys are refused.
 
 | Key           | Default                   | Meaning                                                                                                     |
 | ------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `api_key`     | required                  | A Tenki API key, as an `env:` or `secret:` reference.                                                       |
+| `api_key`     | required                  | The Tenki API key, as an `env:` or `secret:` reference.                                                     |
 | `base_url`    | `https://api.tenki.cloud` | The Tenki API endpoint.                                                                                     |
 | `snapshot_id` | none                      | Boot every VM from this snapshot, for example one with Docker already installed (see below).                |
 | `image`       | the Tenki base image      | Boot every VM from this Tenki registry image instead. At most one of `image` and `snapshot_id`.             |
@@ -66,8 +75,8 @@ Every key goes under `[sandbox.providers.tenki.config]`. Unknown keys are refuse
 
 ## Faster startup
 
-The Tenki base image doesn't ship Docker, so a VM booted from it installs Docker and Compose v2 before agent-env uses
-it, which adds to every VM's start. Snapshot a VM that has them once, and every VM booted from the snapshot skips that:
+A VM booted from the Tenki base image installs Docker and Compose v2 the first time agent-env uses it. Snapshot a VM
+that has them once, and every VM booted from the snapshot skips that step:
 
 ```bash
 tenki sandbox create --name agentenv-docker --cpu 2 --memory-mb 4096 --disk-size-gb 20 --max-duration 30m
@@ -77,60 +86,71 @@ tenki sandbox snapshot create agentenv-docker --name agentenv-docker --wait-dura
 tenki sandbox terminate agentenv-docker
 ```
 
-A snapshot keeps the kernel of the VM it was taken from. If `docker info` fails, that VM's kernel can't run Docker:
-terminate it and create another before taking the snapshot. Then set `snapshot_id` to the snapshot's id. A VM can be
-restored larger than its snapshot but not smaller, so keep the snapshot's VM at 2 vCPU and 4 GiB, the smallest the
-provider starts.
+Then set `snapshot_id` to the snapshot's id. A VM can be restored larger than its snapshot but not smaller, so keep
+the snapshot's VM at 2 vCPU and 4 GiB, the smallest the provider starts. Images your environments and agents pull
+from a registry can be pulled into the same VM before the snapshot; a VM booted from it then finds them in place.
 
-## How it works
+## Resources and lifetime
 
-- **VMs:** each sandbox is one Tenki session, sized to the request: whole vCPUs, memory rounded up to 2 MiB, and a disk
-  of at least `min_disk_gb`. A smaller request is raised to 2 vCPU and 4 GiB, the smallest VM Tenki starts from a warm
-  snapshot; a smaller one would cold boot, which is slower. A request beyond Tenki's limits (128 vCPU, 512 GiB memory,
-  100 GB disk, or the workspace's own lower limit) is refused, not shrunk.
-- **Lifetime:** the sandbox's `timeout` is the VM's hard maximum lifetime, so a crashed run can't leak a VM past it. It
-  is also every command's execution budget. Tenki caps it at the workspace's maximum session duration; a capped VM
-  logs a warning and its commands get the lifetime it was granted.
-- **Commands:** run as root through Tenki's privileged exec, so the `sudo` agent-env prefixes is dropped.
+- **CPU and memory:** whole vCPUs, memory rounded up to 2 MiB. A request below 2 vCPU or 4 GiB is raised to it, the
+  smallest VM Tenki starts from a warm snapshot.
+- **Disk:** at least `min_disk_gb`.
+- **Refused requests:** a request beyond Tenki's limits (128 vCPU, 512 GiB memory, 100 GB disk, or the workspace's own
+  lower limit) is refused before anything is created, not shrunk.
+- **Ignored requests:** `boot_mode` has no Tenki equivalent, so a `boot_mode` that is set logs a warning and has no
+  effect.
+- **Lifetime:** the sandbox's `timeout` is the VM's hard maximum lifetime, so a crashed run can't leave a VM running
+  past it. It is also every command's execution budget. A workspace with a lower maximum session duration grants that
+  instead; the provider logs a warning and budgets commands by the lifetime granted.
+
+## Networking
+
 - **Ports:** each exposed port gets a public HTTPS URL under `sb.tenki.sh`, which fills `tunnel_urls`. It serves HTTP
-  and WebSocket with no platform authentication.
-- **Files:** objects and files go onto the VM over the exec's stdin, or by the VM downloading a signed URL when its
-  egress policy allows that host.
-- **Reconnect:** `get_sandbox` restores the ports and the applied egress policy.
-- **Tags:** every VM is tagged `agentenv` and carries agent-env's attribution in its metadata, so
-  `tenki sandbox list` finds VMs a killed run left behind.
-
-## Network policy
-
-`deploy_sandbox` and `deploy_agent` take a `network_policy`, and Tenki enforces it outside the VM, for the VM and every
-container on it.
-
-- **Entries:** allow-all, or up to 256 hostnames and 64 IPv4 CIDRs. An IP address listed as a host becomes a /32. IPv6
-  is refused.
+  and WebSocket with no platform authentication, like Modal's tunnels.
+- **Egress:** allow-all, or an allowlist of up to 256 hostnames and 64 IPv4 CIDRs. An IP address listed as a host
+  becomes a /32. A policy with IPv6 or malformed entries is refused with `NetworkPolicyUnsupportedError` before
+  anything is created, and a fallback chain skips to its next provider. Tenki applies the policy outside the VM, so
+  one policy covers `dockerd` and every container.
 - **Wildcards:** `*.example.com` covers exactly one label: `files.example.com`, not `a.b.example.com`. List deeper names
   explicitly.
 - **Tenki's own hosts:** `*.sb.tenki.sh` and `*.us.sb.tenki.sh` are added to every allowlist, so a restricted agent can
-  still reach the environments it talks to. A workspace with wildcard preview domains gets URLs one label deeper
+  reach the environments it talks to. A workspace with wildcard preview domains gets URLs one label deeper
   (`<token>.<workspace>.us.sb.tenki.sh`); the provider adds `*.<workspace>.us.sb.tenki.sh` once it has exposed a port
-  there. If a restricted VM is created before any environment in the run, list that entry in its `allow_hosts`.
-- **Fixed for the VM's lifetime:** Tenki sets egress when the VM is created. Where other providers widen an allowlist
-  to download an image or object, this one pushes the bytes over stdin instead, which needs no egress. Image pulls and
-  builds inside the VM still need their registries allowed.
-- **Use a snapshot:** installing Docker on the base image needs the Ubuntu archive, so boot allowlisted VMs from a
-  snapshot that has Docker.
+  there. A restricted VM created before any environment in the run needs that entry in its own `allow_hosts`.
+- **Image and object downloads:** Tenki sets a VM's egress when it is created. Objects and image tarballs whose host the
+  allowlist doesn't cover go over the exec's stdin instead, which needs no egress. Image pulls and builds inside the
+  VM still need their registries allowed, and so does installing Docker on the base image, so boot allowlisted VMs
+  from a snapshot that has Docker.
+- **Reconnect:** `get_sandbox` restores the ports and the applied egress policy.
 
-## Limitations
+## Attribution and cost
 
-- No GPUs.
-- A VM's egress policy can't change after it is created.
-- `create_vm(image=...)` is refused: VMs boot the configured `image` or `snapshot_id`, never an OCI image.
+Every VM is tagged `agentenv` and carries agent-env's attribution, including `[sandbox.attribution]` defaults, in its
+session metadata. `tenki sandbox list --tags agentenv` lists them, and `tenki sandbox get <session id> --json` shows a
+VM's metadata.
 
-## Tests
+## Cleanup
 
-The unit tests (`tst/unit/providers/sandbox_providers/tenki_*`) run offline against in-memory stand-ins for the SDK.
-`tst/integration/providers/sandbox_providers/tenki_sandbox_smoke_test.py` boots real VMs and runs when the resolved
-config can build the provider:
+- A VM whose setup fails after it is created (readiness, ports, Docker) is terminated.
+- If the caller is cancelled while the create is in flight, the provider terminates the VM that create makes once it
+  answers.
+- If a create fails after Tenki may have made the VM, the provider finds that VM by its unique name and terminates it.
+- `terminate` is idempotent: a VM that is already gone or terminating is not an error.
 
-```bash
-make int-test-slow    # with [sandbox.providers.tenki.config] in the config in effect
-```
+## Things to know
+
+- **Commands run as root** through Tenki's privileged exec, so the `sudo` agent-env prefixes is dropped.
+- **Lost connections:** when a command's stream ends without an exit status, `exec` returns exit code -1.
+  `exec_script` retries idempotent scripts on -1 only.
+- **Images:** `create_vm(image=...)` is refused. VMs boot the configured `image` or `snapshot_id`, and OCI images run
+  under Docker inside them.
+- **GPUs** are not supported.
+- **The model key enters the sandbox:** an agent's `LITELLM_API_KEY` is passed in, as on other providers.
+
+## Testing
+
+`tst/integration/providers/sandbox_providers/tenki_sandbox_smoke_test.py` runs against a real Tenki workspace when
+`[sandbox.providers.tenki.config]` resolves, for example with `make int-test-slow`. Otherwise it skips with
+`agentenv-capability-missing: remote_sandbox`. The unit tests are
+`tst/unit/providers/sandbox_providers/tenki_sandbox_provider_test.py` and `tenki_sandbox_test.py`, and run offline
+against in-memory stand-ins for the SDK.

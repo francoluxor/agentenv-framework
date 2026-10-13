@@ -187,8 +187,8 @@ class TenkiSandbox(VmSandbox):
         await self.release()
 
     async def release(self) -> None:
-        """Stop the session's data-plane credential renewal, which the SDK's close_if_open skips for a session it
-        already sees ending and which would otherwise retry for the life of the process."""
+        """Stop the session's data-plane credential renewal, which close_if_open leaves to the caller for a session
+        that is already ending."""
         reset = getattr(self._session, "_reset_data_plane", None)
         if reset is not None:
             await reset()
