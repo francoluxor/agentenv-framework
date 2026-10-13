@@ -185,8 +185,14 @@ def test_core_and_every_store_module_import_without_any_extra():
             "agent_env.providers.sandbox_providers.tensorlake.provider:TensorlakeSandboxProvider",
             "agent_env.providers.sandbox_providers.sandbox_provider:SandboxProvider",
         ),
+        (
+            "tenki",
+            "agent_env.providers.sandbox_providers.tenki.provider:TenkiSandboxProvider",
+            "agent_env.providers.sandbox_providers.sandbox_provider:SandboxProvider",
+        ),
     ],
-    ids=["gcs", "secret-manager", "s3", "s3-reexport", "secrets-manager-reexport", "dynamodb", "dynamodb-reexport", "tensorlake"],
+    ids=["gcs", "secret-manager", "s3", "s3-reexport", "secrets-manager-reexport", "dynamodb", "dynamodb-reexport", "tensorlake",
+         "tenki"],
 )
 def test_an_impl_without_its_extra_names_the_extra_to_install(extra, impl, base):
     message = _run(_LOAD_IMPL, _only_in(extra), impl, base)

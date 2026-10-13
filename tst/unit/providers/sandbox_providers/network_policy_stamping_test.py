@@ -21,6 +21,7 @@ from agent_env.providers.sandbox_providers.sail_vm import _sdk as sail_sdk
 from agent_env.providers.sandbox_providers.sail_vm.provider import SailVmSandboxProvider
 from agent_env.providers.sandbox_providers.sandbox import Sandbox
 from agent_env.providers.sandbox_providers.sandbox_provider import _BUILTIN_SANDBOX_PROVIDERS
+from agent_env.providers.sandbox_providers.tenki.provider import TenkiSandboxProvider
 from agent_env.providers.sandbox_providers.tensorlake.provider import TensorlakeSandboxProvider
 
 
@@ -98,12 +99,22 @@ async def _tensorlake() -> Sandbox:
     return await provider.create_vm(exposed_ports=[], setup_for_gateway=False)
 
 
+async def _tenki() -> Sandbox:
+    session = MagicMock(id="tenki-test")
+    session.wait_ready = AsyncMock()
+    client = MagicMock()
+    client.create = AsyncMock(return_value=session)
+    provider = TenkiSandboxProvider(api_key="test-key", client_cls=MagicMock(return_value=client))
+    return await provider.create_vm(exposed_ports=[], setup_for_gateway=False)
+
+
 FACTORIES = {
     "modal": _modal,
     "modal_vm": _modal_vm,
     "e2b": _e2b,
     "sail_vm": _sail,
     "tensorlake": _tensorlake,
+    "tenki": _tenki,
     "local": _local,
 }
 
