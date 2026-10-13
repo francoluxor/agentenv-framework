@@ -157,6 +157,24 @@ async def test_workspace_preview_domains_join_later_allowlists(client_cls):
     assert "*.acme.us.sb.tenki.sh" in client_cls.instances[-1].create_calls[0]["allow_domains"]
 
 
+@pytest.mark.parametrize(("url", "learned"), [
+    ("https://tok.acme.us.sb.tenki.sh", {"*.acme.us.sb.tenki.sh"}),
+    ("https://tok.sb.tenki.sh", set()),
+    ("https://tok.us.sb.tenki.sh", set()),
+    ("https://tok.evil-sb.tenki.sh", set()),
+    ("https://tok.example.com", set()),
+])
+def test_only_tenki_preview_parents_are_learned(url, learned):
+    provider_module._tunnel_url(url)
+    assert provider_module._preview_parents == learned
+
+
+def test_learned_preview_parents_are_capped():
+    for i in range(provider_module._MAX_PREVIEW_PARENTS + 5):
+        provider_module._tunnel_url(f"https://tok.ws{i}.us.sb.tenki.sh")
+    assert len(provider_module._preview_parents) == provider_module._MAX_PREVIEW_PARENTS
+
+
 @pytest.mark.asyncio
 async def test_create_vm_refuses_an_unenforceable_policy_before_creating(client_cls):
     with pytest.raises(NetworkPolicyUnsupportedError):

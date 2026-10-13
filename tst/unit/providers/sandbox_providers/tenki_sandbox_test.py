@@ -169,6 +169,20 @@ async def test_terminate_closes_the_session_and_the_owned_client_once():
 
 
 @pytest.mark.asyncio
+async def test_a_failed_terminate_keeps_the_client_so_a_retry_can_succeed():
+    session, client = FakeSession(state="RUNNING"), fake_client_cls()()
+    session.close_error = SandboxError("unavailable")
+    sandbox = _sandbox(session, client=client)
+    with pytest.raises(SandboxError):
+        await sandbox.terminate()
+    assert not client.closed
+    session.close_error = None
+    await sandbox.terminate()
+    assert session.closed == 1
+    assert client.closed
+
+
+@pytest.mark.asyncio
 async def test_terminate_tolerates_a_session_that_is_already_gone():
     session = FakeSession(state="RUNNING")
     session.close_error = SessionNotFoundError("gone")

@@ -54,6 +54,8 @@ _reapers: set[asyncio.Task] = set()
 # (<token>.<workspace>.us.sb.tenki.sh), which a one-label wildcard in EGRESS_HOSTS can't cover. The parents seen on
 # exposed ports are added to later allowlists; the API has no call that lists them up front.
 _preview_parents: set[str] = set()
+# A process sees a handful of workspaces; the cap keeps the learned entries well inside MAX_ALLOW_DOMAINS.
+_MAX_PREVIEW_PARENTS = 16
 
 
 def vm_shape(cpu: float, memory_mb: int, disk_size_gb: float, *, min_disk_gb: int) -> tuple[int, int, int]:
@@ -103,8 +105,10 @@ def session_name(attribution: Attribution) -> str:
 def _tunnel_url(url: str) -> str:
     url = url if url.startswith(("http://", "https://")) else f"https://{url}"
     parent = (urlparse(url).hostname or "").partition(".")[2]
-    if parent.endswith("sb.tenki.sh") and f"*.{parent}" not in TenkiSandboxProvider.EGRESS_HOSTS:
-        _preview_parents.add(f"*.{parent}")
+    entry = f"*.{parent}"
+    if (parent.endswith(".sb.tenki.sh") and entry not in TenkiSandboxProvider.EGRESS_HOSTS
+            and len(_preview_parents) < _MAX_PREVIEW_PARENTS):
+        _preview_parents.add(entry)
     return url
 
 

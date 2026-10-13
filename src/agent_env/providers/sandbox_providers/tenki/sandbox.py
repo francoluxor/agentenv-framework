@@ -158,7 +158,8 @@ class TenkiSandbox(VmSandbox):
 
     async def terminate(self) -> None:
         """Terminate the VM. One another handle already terminated, while this handle's cached state still says
-        running, is not an error."""
+        running, is not an error. The client is closed only once the session is ended, so a failed or cancelled
+        attempt leaves this handle able to retry."""
         try:
             await self._session.close_if_open()
         except SessionNotFoundError:
@@ -167,10 +168,9 @@ class TenkiSandbox(VmSandbox):
             if await self._current_state() not in _ENDED_STATES:
                 raise
             logger.info("Tenki session %s was already terminating at terminate", self.sandbox_id)
-        finally:
-            if self._client is not None:
-                await self._client.close()
-                self._client = None
+        client, self._client = self._client, None
+        if client is not None:
+            await client.close()
 
     async def _current_state(self) -> str:
         try:
