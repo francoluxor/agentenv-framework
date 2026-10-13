@@ -48,9 +48,8 @@ if ! iptables -t nat -L >/dev/null 2>&1; then
     "where Docker runs" >&2
   exit 1
 fi
-if ! docker info >/dev/null 2>&1; then
-  systemctl start docker >/dev/null 2>&1 \
-    || setsid nohup dockerd >/var/log/dockerd.log 2>&1 </dev/null &
+if ! docker info >/dev/null 2>&1 && ! systemctl start docker >/dev/null 2>&1; then
+  setsid nohup dockerd >/var/log/dockerd.log 2>&1 </dev/null &
 fi
 for _ in $(seq 90); do
   docker info >/dev/null 2>&1 && exit 0
@@ -67,6 +66,7 @@ _ENDED_STATES = frozenset({"TERMINATING", "TERMINATED", "GONE"})
 _UNKNOWN_EXIT_CODE = -1
 _TIMED_OUT_EXIT_CODE = 124
 _STDIN_QUEUE_LIMIT = 16
+_REAP_TIMEOUT_SEC = 10
 
 
 def allows_host(policy: NetworkPolicy, host: str) -> bool:
@@ -216,19 +216,34 @@ class TenkiSandbox(VmSandbox):
                 await self._wait_for_stdin_drain(process)
             await process.close_stdin()
         except BaseException:
-            await process.kill()
+            await self._reap(process)
             raise
         result = await process.wait()
         return result.exit_code, result.stdout_text, result.stderr_text
 
     @staticmethod
+    async def _reap(process: Any) -> None:
+        """Close stdin, kill and wait for a process whose input failed, so the remote command and the SDK stream end
+        now rather than at the command's timeout. Its own failures are logged, never raised over the original one."""
+        for step in (process.close_stdin, process.kill, lambda: process.wait(timeout=_REAP_TIMEOUT_SEC)):
+            try:
+                await step()
+            except Exception as exc:  # noqa: BLE001 - the input's failure is the one to report
+                logger.debug("Reaping a failed stdin exec: %s: %s", type(exc).__name__, exc)
+
+    @staticmethod
     async def _wait_for_stdin_drain(process: Any) -> None:
         """The SDK queues stdin without bound, so a fast reader would buffer a whole object in memory; wait for the
-        stream to catch up."""
+        stream to catch up. A stream that ended stops draining: its error is raised, or the next write reports it."""
         queue = getattr(process, "_outbound", None)
-        if not isinstance(queue, asyncio.Queue):
+        done = getattr(process, "_done", None)
+        if not isinstance(queue, asyncio.Queue) or not isinstance(done, asyncio.Event):
             return
         while queue.qsize() > _STDIN_QUEUE_LIMIT:
+            if done.is_set():
+                if (error := getattr(process, "_error", None)) is not None:
+                    raise error
+                return
             await asyncio.sleep(0.005)
 
     async def wait_for_vm(self) -> None:

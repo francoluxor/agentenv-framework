@@ -255,11 +255,7 @@ class TenkiSandboxProvider(SandboxProvider):
             create_kwargs["snapshot_id"] = self._snapshot_id
 
         client = self._client()
-        try:
-            session = await self._create_or_reclaim(client, create_kwargs, effective_policy, timeout)
-        except BaseException:
-            await client.close()
-            raise
+        session = await self._create_or_reclaim(client, create_kwargs, effective_policy, timeout)
         sandbox = TenkiSandbox(
             session, client=client, tunnel_urls={}, network_policy=effective_policy, command_timeout=timeout,
         )
@@ -284,17 +280,19 @@ class TenkiSandboxProvider(SandboxProvider):
     async def _create_or_reclaim(
         client: Any, create_kwargs: dict[str, Any], policy: NetworkPolicy, timeout: int
     ) -> Any:
-        """Await the create. If the caller is cancelled first, terminate the VM it yields, which would otherwise run
-        with no handle until its max lifetime."""
+        """Await the create, closing ``client`` if it fails. If the caller is cancelled first, the create's outcome
+        owns ``client``: the VM it yields is terminated, which would otherwise run with no handle until its max
+        lifetime, and that closes the client; a create that fails closes it directly."""
         task = asyncio.ensure_future(client.create(**create_kwargs))
 
         def terminate_orphan(done: asyncio.Future) -> None:
             if done.cancelled() or done.exception() is not None:
-                return
-            orphan = TenkiSandbox(
-                done.result(), client=client, tunnel_urls={}, network_policy=policy, command_timeout=timeout,
-            )
-            reaper = asyncio.ensure_future(_reap(orphan))
+                cleanup = client.close()
+            else:
+                cleanup = _reap(TenkiSandbox(
+                    done.result(), client=client, tunnel_urls={}, network_policy=policy, command_timeout=timeout,
+                ))
+            reaper = asyncio.ensure_future(cleanup)
             _reapers.add(reaper)
             reaper.add_done_callback(_reapers.discard)
 
@@ -302,6 +300,9 @@ class TenkiSandboxProvider(SandboxProvider):
             return await asyncio.shield(task)
         except asyncio.CancelledError:
             task.add_done_callback(terminate_orphan)
+            raise
+        except BaseException:
+            await client.close()
             raise
 
     @staticmethod

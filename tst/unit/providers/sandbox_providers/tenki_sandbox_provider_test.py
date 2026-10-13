@@ -200,10 +200,35 @@ async def test_a_cancelled_create_reaps_the_vm(client_cls):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    await asyncio.sleep(0.1)
     client = client_cls.instances[0]
+    assert not client.closed, "the reaper still needs the client to terminate the VM"
+    await asyncio.sleep(0.1)
     assert client.sessions["sess-1"].closed == 1
     assert client.closed
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_create_that_then_fails_still_closes_the_client(client_cls):
+    def failing_slow_create(client):
+        client.create_delay = 0.05
+        client.create_error = RuntimeError("capacity unavailable")
+
+    client_cls.on_init = failing_slow_create
+    task = asyncio.ensure_future(_provider(client_cls).create_vm(setup_for_gateway=False))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.1)
+    assert client_cls.instances[0].closed
+
+
+@pytest.mark.asyncio
+async def test_a_failed_create_closes_the_client(client_cls):
+    client_cls.on_init = lambda client: setattr(client, "create_error", RuntimeError("capacity unavailable"))
+    with pytest.raises(RuntimeError, match="capacity unavailable"):
+        await _provider(client_cls).create_vm(setup_for_gateway=False)
+    assert client_cls.instances[0].closed
 
 
 @pytest.mark.asyncio

@@ -25,17 +25,21 @@ class FakeProcess:
         self.stdin: list[bytes] = []
         self.stdin_closed = False
         self.killed = False
+        self.calls: list[str] = []
 
     async def write_stdin(self, data: bytes) -> None:
         self.stdin.append(data)
 
     async def close_stdin(self) -> None:
+        self.calls.append("close_stdin")
         self.stdin_closed = True
 
     async def kill(self) -> None:
+        self.calls.append("kill")
         self.killed = True
 
-    async def wait(self) -> CommandResult:
+    async def wait(self, timeout: float | None = None) -> CommandResult:
+        self.calls.append("wait")
         return self._result
 
 
@@ -107,6 +111,7 @@ class FakeClient:
         self.sessions: dict[str, FakeSession] = {}
         self.closed = False
         self.create_delay = 0.0
+        self.create_error: BaseException | None = None
         self.next_session: FakeSession | None = None
         type(self).instances.append(self)
         if type(self).on_init is not None:
@@ -116,6 +121,8 @@ class FakeClient:
         self.create_calls.append(kwargs)
         if self.create_delay:
             await asyncio.sleep(self.create_delay)
+        if self.create_error is not None:
+            raise self.create_error
         session = self.next_session or FakeSession()
         self.sessions[session.id] = session
         return session

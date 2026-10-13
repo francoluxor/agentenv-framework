@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -101,7 +102,52 @@ async def test_exec_with_stdin_kills_the_process_when_the_reader_fails():
 
     with pytest.raises(OSError):
         await _sandbox(session)._exec_with_stdin("cat > /x", pieces())
-    assert session.processes[0].killed
+    assert session.processes[0].calls == ["close_stdin", "kill", "wait"]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_reap_does_not_mask_the_input_error():
+    session = FakeSession()
+
+    async def pieces():
+        yield b"ab"
+        raise OSError("disk read failed")
+
+    async def stream_gone(*_args, **_kwargs):
+        raise StreamClosedError("stream closed")
+
+    process_start = session.start
+
+    async def start(*argv, **kwargs):
+        process = await process_start(*argv, **kwargs)
+        process.close_stdin = process.kill = process.wait = stream_gone
+        return process
+
+    session.start = start
+    with pytest.raises(OSError, match="disk read failed"):
+        await _sandbox(session)._exec_with_stdin("cat > /x", pieces())
+
+
+def _stalled_process(*, error: BaseException | None) -> SimpleNamespace:
+    queue: asyncio.Queue = asyncio.Queue()
+    for _ in range(sandbox_module._STDIN_QUEUE_LIMIT + 4):
+        queue.put_nowait(object())
+    done = asyncio.Event()
+    done.set()
+    return SimpleNamespace(_outbound=queue, _done=done, _error=error)
+
+
+@pytest.mark.asyncio
+async def test_the_stdin_drain_raises_the_error_of_a_stream_that_died():
+    with pytest.raises(StreamClosedError):
+        await asyncio.wait_for(
+            TenkiSandbox._wait_for_stdin_drain(_stalled_process(error=StreamClosedError("stream closed"))), 1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_stdin_drain_returns_once_the_command_ended():
+    await asyncio.wait_for(TenkiSandbox._wait_for_stdin_drain(_stalled_process(error=None)), 1)
 
 
 @pytest.mark.asyncio
