@@ -7,6 +7,7 @@ through the inherited ``VmSandbox`` helpers; a VM booted from an image without D
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import logging
 import math
@@ -124,13 +125,21 @@ async def _reap(sandbox: TenkiSandbox) -> None:
     for attempt in range(_REAP_ATTEMPTS):
         try:
             await sandbox.terminate()
-            logger.info("Terminated Tenki VM %s, created after its caller was cancelled", sandbox.sandbox_id)
+            logger.info("Terminated Tenki VM %s after its create failed or was cancelled", sandbox.sandbox_id)
             return
         except Exception as exc:  # noqa: BLE001 - retried, then logged
-            logger.warning("Terminating orphaned Tenki VM %s failed (attempt %s): %s", sandbox.sandbox_id,
+            logger.warning("Terminating Tenki VM %s failed (attempt %s): %s", sandbox.sandbox_id,
                            attempt + 1, exc)
             await asyncio.sleep(2**attempt)
-    logger.error("Orphaned Tenki VM %s is still running; it stops at its max lifetime", sandbox.sandbox_id)
+    logger.error("Tenki VM %s from a failed create is still running; it stops at its max lifetime", sandbox.sandbox_id)
+
+
+def _spawn(cleanup: Any) -> asyncio.Task:
+    """Run ``cleanup`` as a task no caller's cancellation reaches, kept referenced until it ends."""
+    task = asyncio.ensure_future(cleanup)
+    _reapers.add(task)
+    task.add_done_callback(_reapers.discard)
+    return task
 
 
 class TenkiSandboxProvider(SandboxProvider):
@@ -273,11 +282,13 @@ class TenkiSandboxProvider(SandboxProvider):
             if setup_for_gateway:
                 await sandbox.setup_vm_for_gateway(ports)
             return sandbox
-        except BaseException:
-            try:
-                await sandbox.terminate()
-            except Exception as cleanup_error:  # noqa: BLE001 - cleanup must not mask the create failure
-                logger.warning("Failed to terminate Tenki VM %s after setup failure: %s", session.id, cleanup_error)
+        except BaseException as error:
+            # The VM is terminated, with retries, whatever happens to this task; a failure waits for it and a
+            # cancellation leaves it running. The create's own error is the one raised.
+            reaper = _spawn(_reap(sandbox))
+            if not isinstance(error, asyncio.CancelledError):
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.shield(reaper)
             raise
 
     @staticmethod
@@ -296,9 +307,7 @@ class TenkiSandboxProvider(SandboxProvider):
                 cleanup = _reap(TenkiSandbox(
                     done.result(), client=client, tunnel_urls={}, network_policy=policy, command_timeout=timeout,
                 ))
-            reaper = asyncio.ensure_future(cleanup)
-            _reapers.add(reaper)
-            reaper.add_done_callback(_reapers.discard)
+            _spawn(cleanup)
 
         try:
             return await asyncio.shield(task)

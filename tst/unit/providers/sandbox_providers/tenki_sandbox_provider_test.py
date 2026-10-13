@@ -211,6 +211,21 @@ async def test_a_setup_failure_terminates_the_vm_and_closes_the_client(client_cl
 
 
 @pytest.mark.asyncio
+async def test_a_create_cancelled_while_the_vm_boots_still_terminates_it(client_cls):
+    session = FakeSession()
+    session.ready_delay = 0.05
+    client_cls.on_init = lambda client: setattr(client, "next_session", session)
+    task = asyncio.ensure_future(_provider(client_cls).create_vm(setup_for_gateway=False))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.05)
+    assert session.closed == 1
+    assert client_cls.instances[0].closed
+
+
+@pytest.mark.asyncio
 async def test_a_cancelled_create_reaps_the_vm(client_cls):
     client_cls.on_init = lambda client: setattr(client, "create_delay", 0.05)
     task = asyncio.ensure_future(_provider(client_cls).create_vm(setup_for_gateway=False))

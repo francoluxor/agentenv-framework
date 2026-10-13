@@ -106,6 +106,26 @@ async def test_exec_with_stdin_kills_the_process_when_the_reader_fails():
 
 
 @pytest.mark.asyncio
+async def test_a_wait_that_fails_reaps_the_process():
+    session = FakeSession()
+    process_start = session.start
+
+    async def start(*argv, **kwargs):
+        process = await process_start(*argv, **kwargs)
+        process.wait_error = StreamClosedError("stream closed")
+        return process
+
+    session.start = start
+
+    async def pieces():
+        yield b"ab"
+
+    with pytest.raises(StreamClosedError):
+        await _sandbox(session)._exec_with_stdin("cat > /x", pieces())
+    assert session.processes[0].calls == ["close_stdin", "wait", "close_stdin", "kill", "wait"]
+
+
+@pytest.mark.asyncio
 async def test_a_failing_reap_does_not_mask_the_input_error():
     session = FakeSession()
 

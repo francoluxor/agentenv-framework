@@ -215,10 +215,10 @@ class TenkiSandbox(VmSandbox):
                 await process.write_stdin(piece)
                 await self._wait_for_stdin_drain(process)
             await process.close_stdin()
+            result = await process.wait()
         except BaseException:
             await self._reap(process)
             raise
-        result = await process.wait()
         return result.exit_code, result.stdout_text, result.stderr_text
 
     @staticmethod

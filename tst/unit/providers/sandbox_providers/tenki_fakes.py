@@ -26,6 +26,7 @@ class FakeProcess:
         self.stdin_closed = False
         self.killed = False
         self.calls: list[str] = []
+        self.wait_error: BaseException | None = None
 
     async def write_stdin(self, data: bytes) -> None:
         self.stdin.append(data)
@@ -40,6 +41,8 @@ class FakeProcess:
 
     async def wait(self, timeout: float | None = None) -> CommandResult:
         self.calls.append("wait")
+        if self.wait_error is not None and len([c for c in self.calls if c == "wait"]) == 1:
+            raise self.wait_error
         return self._result
 
 
@@ -55,6 +58,7 @@ class FakeSession:
         self.exposed: dict[int, str] = {}
         self.closed = 0
         self.close_error: BaseException | None = None
+        self.ready_delay = 0.0
         self.preview_parent = "sb.tenki.sh"
 
     @property
@@ -62,6 +66,8 @@ class FakeSession:
         return self.info.state
 
     async def wait_ready(self, timeout: float = 180) -> None:
+        if self.ready_delay:
+            await asyncio.sleep(self.ready_delay)
         self.info.state = "RUNNING"
 
     def _next(self, argv: tuple[str, ...], timeout: Any, privileged: bool) -> CommandResult:
