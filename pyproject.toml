@@ -76,8 +76,12 @@ sail = [
 tensorlake = [
     "tensorlake~=0.5.140",  # AsyncSandbox APIs validated against 0.5.140 to 0.5.149
 ]
+# The Tenki Sandbox VM provider, selected as the built-in `tenki` backend.
+tenki = [
+    "tenki[async]~=1.4.1",  # AsyncClient/AsyncSandbox exec, stdin, ports and egress APIs validated against the 1.4 line
+]
 dev = [
-    "agentenv-framework[aws,explorer,gcp,sail,tensorlake]",  # so the AWS, explorer, GCP backend, Sail and Tensorlake provider tests run in CI
+    "agentenv-framework[aws,explorer,gcp,sail,tensorlake,tenki]",  # so the AWS, explorer, GCP backend, Sail, Tensorlake and Tenki provider tests run in CI
     "fastmcp>=3.4,<4",  # the standalone-fastmcp mount path of the protocol; <4 keeps mcp 1.x
     "griffelib==2.3.0",  # the plugin API check; exact, since what it reports as a break changes between releases
     "moto>=5.0.0",
