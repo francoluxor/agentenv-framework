@@ -110,6 +110,7 @@ class EpisodeSpec:
         except asyncio.CancelledError:
             episode._abandoned = "start() was cancelled"
             episode._run.cancel()
+            await asyncio.wait((episode._run,))
             raise
         return episode
 

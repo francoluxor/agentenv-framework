@@ -52,16 +52,16 @@ An episode is one run of a task in which some of its agents are played from outs
 from agentenv_protocol import ToolSession
 from agent_env.task import EpisodeSpec, Task
 
-spec = EpisodeSpec.from_task(Task.get("my-task"))
+spec = EpisodeSpec.from_task(Task.get("my-task"), turn_timeout=900)
 episode = await spec.start()
-turn = await episode.next_turn()
-async with ToolSession(mcp_url=turn.mcp_urls["my-env"], role=turn.role, headers=turn.headers["my-env"]) as tools:
-    ...  # your model reads turn.prompt and calls tools.call_tool(name, arguments)
-await turn.end(response="Done.")
+while (turn := await episode.next_turn()) is not None:
+    async with ToolSession(mcp_url=turn.mcp_urls["my-env"], role=turn.role, headers=turn.headers["my-env"]) as tools:
+        ...  # your model reads turn.prompt and calls tools.call_tool(name, arguments)
+    await turn.end(response="Done.")
 reward = await episode.result()
 ```
 
-The reward is the score of the task's one top-level verifier, `episode.abandon(reason)` stops a run early, and `from_task` names any step an outside player can't stand behind. [Running tasks](https://www.agentenvframework.com/docs/tasks/running) covers the rest.
+The reward is the score of the task's one top-level verifier, `turn_timeout` is each turn's deadline in seconds (the prompt's own `timeout_seconds` otherwise), `episode.abandon(reason)` stops a run early, and `from_task` names any step an outside player can't stand behind. [Running tasks](https://www.agentenvframework.com/docs/tasks/running) covers the rest.
 
 ## Plugins
 

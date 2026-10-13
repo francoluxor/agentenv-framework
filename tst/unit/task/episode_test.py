@@ -763,6 +763,6 @@ async def test_a_cancelled_start_takes_its_run_down_with_it(teardowns):
     starting.cancel()
     with pytest.raises(asyncio.CancelledError):
         await starting
-    await _until(lambda: not episode_module._live)
 
+    assert not episode_module._live
     assert teardowns.finished == teardowns.started and len(teardowns.finished) == 1
