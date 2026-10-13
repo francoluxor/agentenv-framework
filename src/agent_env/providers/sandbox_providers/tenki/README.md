@@ -1,9 +1,9 @@
 # `tenki` sandbox provider
 
 Runs agent-env sandboxes on [Tenki Sandbox](https://tenki.cloud/docs/sandbox) VMs. Each environment and each agent
-gets its own Linux VM, with Docker inside and public HTTPS URLs for its ports. Like `modal_vm`, `e2b`, `sail_vm` and
-`tensorlake`, it is a VM provider: agent-env's docker-in-VM flows run on it unchanged. That covers the gateway's
-docker-compose, an agent's `docker run`, image loading and artifact collection.
+gets its own Linux VM, with Docker inside and public HTTPS URLs for its ports. It is a VM provider: agent-env's
+docker-in-VM flows run on it unchanged. That covers the gateway's docker-compose, an agent's `docker run`, image loading
+and artifact collection.
 
 ## Set up
 
@@ -106,7 +106,7 @@ from a registry can be pulled into the same VM before the snapshot; a VM booted 
 ## Networking
 
 - **Ports:** each exposed port gets a public HTTPS URL under `sb.tenki.sh`, which fills `tunnel_urls`. It serves HTTP
-  and WebSocket with no platform authentication, like Modal's tunnels.
+  and WebSocket with no platform authentication.
 - **Egress:** allow-all, or an allowlist of up to 256 hostnames and 64 IPv4 CIDRs. An IP address listed as a host
   becomes a /32. A policy with IPv6 or malformed entries is refused with `NetworkPolicyUnsupportedError` before
   anything is created, and a fallback chain skips to its next provider. Tenki applies the policy outside the VM, so
