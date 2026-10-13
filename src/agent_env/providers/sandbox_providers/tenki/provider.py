@@ -54,9 +54,9 @@ _LIFETIME_SLACK_SEC = 60
 _REAP_ATTEMPTS = 3
 _reapers: set[asyncio.Task] = set()
 
-# A workspace with wildcard preview domains gets URLs two labels under the regional suffix
-# (<token>.<workspace>.us.sb.tenki.sh), which a one-label wildcard in EGRESS_HOSTS can't cover. The parents seen on
-# exposed ports are added to later allowlists; the API has no call that lists them up front.
+# A workspace can serve its ports under its own domain, two labels under the regional suffix
+# (<token>.<workspace>.us.sb.tenki.sh). The parents seen on exposed ports are added to later allowlists, so a
+# restricted agent reaches environments served there.
 _preview_parents: set[str] = set()
 # A process sees a handful of workspaces; the cap keeps the learned entries well inside MAX_ALLOW_DOMAINS.
 _MAX_PREVIEW_PARENTS = 16

@@ -263,7 +263,7 @@ class TenkiSandbox(VmSandbox):
 
     @staticmethod
     async def _wait_for_stdin_drain(process: Any) -> bool:
-        """The SDK queues stdin without bound, so a fast reader would buffer a whole object in memory; wait for the
+        """Stdin is queued as it is written, so a fast reader would buffer a whole object in memory; wait for the
         stream to catch up. True once the command has ended, so the caller stops reading input nobody will consume;
         a stream that ended in error raises it."""
         queue = getattr(process, "_outbound", None)
@@ -295,8 +295,8 @@ class TenkiSandbox(VmSandbox):
         if exit_code != 0:
             raise RuntimeError(f"Tenki VM {self.sandbox_id} has no Docker Compose v2: {(stderr or stdout).strip()}")
 
-    # Tenki's file API reaches only the guest user's home, so bytes go over exec stdin as root, which reaches any path.
-    # Stdin also needs no egress: Tenki fixes a session's egress policy at create, so a download host can't be added.
+    # Bytes go over exec stdin as root, which reaches any path on the VM and needs no egress, so they arrive whatever
+    # the VM's egress policy, which is set when the VM is created.
 
     async def _write_bytes_to_vm_path(self, data: bytes, vm_path: str) -> None:
         async def pieces() -> AsyncIterator[bytes]:
