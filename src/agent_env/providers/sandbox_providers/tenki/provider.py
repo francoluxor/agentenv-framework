@@ -75,9 +75,10 @@ def vm_shape(cpu: float, memory_mb: int, disk_size_gb: float, *, min_disk_gb: in
 
 
 def _split_entries(policy: NetworkPolicy) -> tuple[list[str], list[str]]:
-    """Tenki's ``allow_domains`` and ``allow_cidrs``; an IP address listed as a host becomes a /32."""
+    """Tenki's ``allow_domains`` and ``allow_cidrs``, CIDRs normalized; an IP address listed as a host becomes a /32.
+    A malformed CIDR raises ValueError."""
     domains: list[str] = []
-    cidrs = list(policy.allow_cidrs)
+    cidrs = [str(ipaddress.ip_network(cidr, strict=False)) for cidr in policy.allow_cidrs]
     for host in policy.allow_hosts:
         try:
             cidrs.append(str(ipaddress.ip_network(host, strict=False)))
@@ -122,16 +123,30 @@ def _remaining_lifetime(timeout_at: datetime | None) -> int:
 
 
 async def _reap(sandbox: TenkiSandbox) -> None:
+    """Terminate ``sandbox``, retrying. A cancellation, as ``asyncio.run`` sends every task left when it ends, is
+    honored only after the terminate settles, so Ctrl-C during a create doesn't leave its VM running."""
+    cancelled = False
     for attempt in range(_REAP_ATTEMPTS):
         try:
             await sandbox.terminate()
             logger.info("Terminated Tenki VM %s after its create failed or was cancelled", sandbox.sandbox_id)
-            return
+            break
+        except asyncio.CancelledError:
+            cancelled = True
         except Exception as exc:  # noqa: BLE001 - retried, then logged
-            logger.warning("Terminating Tenki VM %s failed (attempt %s): %s", sandbox.sandbox_id,
-                           attempt + 1, exc)
-            await asyncio.sleep(2**attempt)
-    logger.error("Tenki VM %s from a failed create is still running; it stops at its max lifetime", sandbox.sandbox_id)
+            logger.warning("Terminating Tenki VM %s failed (attempt %s): %s", sandbox.sandbox_id, attempt + 1, exc)
+            if attempt + 1 < _REAP_ATTEMPTS and not cancelled:
+                try:
+                    await asyncio.sleep(2**attempt)
+                except asyncio.CancelledError:
+                    cancelled = True
+    else:
+        logger.error("Tenki VM %s from a failed create is still running; it stops at its max lifetime",
+                     sandbox.sandbox_id)
+        with contextlib.suppress(Exception):
+            await sandbox.close_client()
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 def _spawn(cleanup: Any) -> asyncio.Task:
@@ -204,7 +219,10 @@ class TenkiSandboxProvider(SandboxProvider):
         """Allow-all, or an allowlist of hostnames and IPv4 addresses or CIDRs within Tenki's limits."""
         if not policy.restricts_egress:
             return True
-        domains, cidrs = _split_entries(policy)
+        try:
+            domains, cidrs = _split_entries(policy)
+        except ValueError:
+            return False
         return (
             len(domains) <= MAX_ALLOW_DOMAINS
             and len(cidrs) <= MAX_ALLOW_CIDRS
@@ -274,6 +292,13 @@ class TenkiSandboxProvider(SandboxProvider):
         )
         try:
             await session.wait_ready(timeout=READY_TIMEOUT_SEC)
+            granted = _remaining_lifetime(session.info.timeout_at) if session.info.timeout_at else timeout
+            if granted < timeout:
+                logger.warning(
+                    "Tenki capped VM %s's lifetime to %ss of the %ss requested: the workspace's maximum session "
+                    "duration is lower", session.id, granted, timeout,
+                )
+                sandbox.command_timeout = granted
             sandbox.tunnel_urls = await self._expose(session, ports)
             logger.info(
                 "Tenki VM started: session_id=%s cpu=%s memory=%sMB disk=%sGB ports=%s attribution=%s",

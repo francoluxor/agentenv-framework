@@ -21,6 +21,8 @@ from agent_env.providers.sandbox_providers.tenki.provider import (
     vm_shape,
 )
 from agent_env.providers.sandbox_providers.tenki.sandbox import DOCKER_BOOTSTRAP, TenkiSandbox
+from tenki import SandboxError
+
 from tst.unit.providers.sandbox_providers.tenki_fakes import FakeSession, fake_client_cls, result
 
 ALLOWLIST = NetworkMode.ALLOWLIST
@@ -126,7 +128,7 @@ async def test_create_vm_sizes_tags_and_exposes_ports(client_cls):
     assert isinstance(sandbox, TenkiSandbox)
     assert (sandbox.type, sandbox.mode) == ("tenki", "vm")
     assert sandbox.tunnel_urls == {8080: "https://p8080-sess-1.sb.tenki.sh", 9000: "https://p9000-sess-1.sb.tenki.sh"}
-    assert sandbox._command_timeout == 900
+    assert sandbox.command_timeout == 900
 
 
 @pytest.mark.asyncio
@@ -173,6 +175,39 @@ def test_learned_preview_parents_are_capped():
     for i in range(provider_module._MAX_PREVIEW_PARENTS + 5):
         provider_module._tunnel_url(f"https://tok.ws{i}.us.sb.tenki.sh")
     assert len(provider_module._preview_parents) == provider_module._MAX_PREVIEW_PARENTS
+
+
+def test_a_malformed_cidr_is_unsupported_rather_than_an_error():
+    assert not TenkiSandboxProvider.supports_network_policy(NetworkPolicy(mode=ALLOWLIST, allow_cidrs=("10.0.0.300/8",)))
+
+
+def test_cidrs_are_normalized():
+    assert egress_kwargs(NetworkPolicy(mode=ALLOWLIST, allow_cidrs=("10.0.0.1/8",)))["allow_cidrs"] == ["10.0.0.0/8"]
+
+
+@pytest.mark.asyncio
+async def test_a_lifetime_tenki_capped_becomes_the_command_budget(client_cls, caplog):
+    session = FakeSession(timeout_at=datetime.now(UTC) + timedelta(hours=2))
+    client_cls.on_init = lambda client: setattr(client, "next_session", session)
+    sandbox = await _provider(client_cls).create_vm(timeout=3 * 3600, setup_for_gateway=False)
+    assert 7100 <= sandbox.command_timeout <= 7200
+    assert "capped" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_reaper_that_gives_up_closes_the_client(monkeypatch):
+    slept = []
+
+    async def no_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(provider_module.asyncio, "sleep", no_sleep)
+    session, client = FakeSession(state="RUNNING"), fake_client_cls()()
+    session.close_error = SandboxError("unavailable")
+    await provider_module._reap(TenkiSandbox(session, client=client, tunnel_urls={}, network_policy=NetworkPolicy(),
+                                             command_timeout=60))
+    assert slept == [1, 2]
+    assert client.closed
 
 
 @pytest.mark.asyncio
@@ -283,6 +318,6 @@ async def test_get_sandbox_restores_ports_policy_and_lifetime(client_cls):
     sandbox = await _provider(client_cls).get_sandbox("sess-9")
     assert sandbox.tunnel_urls == {8080: "https://p8080.sb.tenki.sh"}
     assert sandbox.network_policy == NetworkPolicy(mode=ALLOWLIST, allow_hosts=("pypi.org",), allow_cidrs=("10.0.0.0/8",))
-    assert 1700 <= sandbox._command_timeout <= 1800
+    assert 1700 <= sandbox.command_timeout <= 1800
     await sandbox.terminate()
     assert client_cls.instances[0].closed

@@ -6,7 +6,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from tenki import InvalidStateError, SandboxError, SessionNotFoundError, StreamClosedError
+from tenki import InvalidStateError, SandboxError, SessionNotFoundError, SessionTerminatedError, StreamClosedError
 from tenki_sandbox.models import SessionEgressPolicy
 
 from agent_env.providers.sandbox_providers.sandbox import NetworkMode, NetworkPolicy
@@ -43,13 +43,34 @@ async def test_exec_runs_as_root_with_the_lifetime_budget_and_drops_sudo():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", [_transient(), StreamClosedError("stream closed")])
+@pytest.mark.parametrize("error", [_transient(), SandboxError("sandbox run stream closed before exit")])
 async def test_a_lost_stream_is_exit_minus_one_with_no_stdout(error):
     session = FakeSession()
     session.results = [error]
     exit_code, stdout, stderr = await _sandbox(session).exec_with_output("true")
     assert (exit_code, stdout) == (-1, "")
     assert type(error).__name__ in stderr
+
+
+@pytest.mark.asyncio
+async def test_a_terminated_session_raises_rather_than_reads_as_a_lost_stream():
+    session = FakeSession()
+    session.results = [SessionTerminatedError("session terminated")]
+    with pytest.raises(SessionTerminatedError):
+        await _sandbox(session).exec_with_output("true")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("fields", "exit_code", "note"), [
+    ({"signal": "killed", "reason": "signaled"}, 137, "killed by signal: killed"),
+    ({"reason": 'exec: "nope": executable file not found in $PATH'}, 127, "executable file not found"),
+])
+async def test_tenkis_minus_one_for_a_signal_or_a_failed_start_gets_the_shells_code(fields, exit_code, note):
+    session = FakeSession()
+    session.results = [result(exit_code=-1, **fields)]
+    code, _, stderr = await _sandbox(session).exec_with_output("nope")
+    assert code == exit_code
+    assert note in stderr
 
 
 @pytest.mark.asyncio
@@ -148,6 +169,38 @@ async def test_a_failing_reap_does_not_mask_the_input_error():
         await _sandbox(session)._exec_with_stdin("cat > /x", pieces())
 
 
+@pytest.mark.asyncio
+async def test_stdin_stops_reading_once_the_command_ended(monkeypatch):
+    session = FakeSession()
+    read = []
+
+    async def pieces():
+        for i in range(5):
+            read.append(i)
+            yield b"x"
+
+    async def ended(_process):
+        return True
+
+    monkeypatch.setattr(TenkiSandbox, "_wait_for_stdin_drain", staticmethod(ended))
+    await _sandbox(session)._exec_with_stdin("cat > /x", pieces())
+    assert read == [0]
+
+
+@pytest.mark.asyncio
+async def test_close_client_stops_the_data_plane_renewal_first():
+    calls = []
+    session, client = FakeSession(state="TERMINATING"), fake_client_cls()()
+
+    async def reset():
+        calls.append("reset")
+
+    session._reset_data_plane = reset
+    await _sandbox(session, client=client).terminate()
+    assert calls == ["reset"]
+    assert client.closed
+
+
 def _stalled_process(*, error: BaseException | None) -> SimpleNamespace:
     queue: asyncio.Queue = asyncio.Queue()
     for _ in range(sandbox_module._STDIN_QUEUE_LIMIT + 4):
@@ -167,7 +220,7 @@ async def test_the_stdin_drain_raises_the_error_of_a_stream_that_died():
 
 @pytest.mark.asyncio
 async def test_the_stdin_drain_returns_once_the_command_ended():
-    await asyncio.wait_for(TenkiSandbox._wait_for_stdin_drain(_stalled_process(error=None)), 1)
+    assert await asyncio.wait_for(TenkiSandbox._wait_for_stdin_drain(_stalled_process(error=None)), 1)
 
 
 @pytest.mark.asyncio

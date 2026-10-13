@@ -15,7 +15,7 @@ from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
-from tenki import InvalidStateError, SandboxError, SessionNotFoundError, SessionTerminatedError, StreamClosedError
+from tenki import InvalidStateError, SandboxError, SessionNotFoundError, SessionTerminatedError
 
 from agent_env.config import get_config
 from agent_env.providers.sandbox_providers.sandbox import (
@@ -66,6 +66,13 @@ _ENDED_STATES = frozenset({"TERMINATING", "TERMINATED", "GONE"})
 _UNKNOWN_EXIT_CODE = -1
 _TIMED_OUT_EXIT_CODE = 124
 _STDIN_QUEUE_LIMIT = 16
+# How the SDK reports a run stream that ended before the command did.
+_STREAM_CLOSED = "stream closed before exit"
+# Tenki reports a command killed by a signal, or one that never started, as exit -1; agent-env reads -1 as a lost
+# stream, so these get the shell's codes instead: 128 + the signal's number, or 127.
+_SIGNAL_NUMBERS = {"hangup": 1, "interrupt": 2, "quit": 3, "aborted": 6, "killed": 9, "segmentation fault": 11,
+                   "broken pipe": 13, "terminated": 15}
+_NOT_STARTED_EXIT_CODE = 127
 _REAP_TIMEOUT_SEC = 10
 
 
@@ -105,7 +112,19 @@ def policy_from_info(info: Any) -> NetworkPolicy:
 
 
 def _is_transient(exc: BaseException) -> bool:
-    return isinstance(exc, StreamClosedError) or bool(getattr(exc, "retryable", False))
+    """A dropped stream or an unavailable data plane, which a rerun can get past; a terminated session is not."""
+    if isinstance(exc, SessionTerminatedError):
+        return False
+    return bool(getattr(exc, "retryable", False)) or _STREAM_CLOSED in str(exc)
+
+
+def _exit_status(result: Any) -> tuple[int, bytes]:
+    """``result``'s exit code and a note for its stderr, with Tenki's -1 for a signal or a failed start mapped."""
+    if result.exit_code != _UNKNOWN_EXIT_CODE:
+        return result.exit_code, b""
+    if result.signal:
+        return 128 + _SIGNAL_NUMBERS.get(str(result.signal).lower(), 0), f"\nkilled by signal: {result.signal}".encode()
+    return _NOT_STARTED_EXIT_CODE, f"\ncommand did not run: {result.reason or 'unknown reason'}".encode()
 
 
 class _BytesReader:
@@ -149,7 +168,7 @@ class TenkiSandbox(VmSandbox):
     ):
         self._session = session
         self._client = client
-        self._command_timeout = command_timeout
+        self.command_timeout = command_timeout
         self.sandbox_id = session.id
         self.mode = SANDBOX_MODE_VM
         self.vnc_url = None
@@ -168,6 +187,14 @@ class TenkiSandbox(VmSandbox):
             if await self._current_state() not in _ENDED_STATES:
                 raise
             logger.info("Tenki session %s was already terminating at terminate", self.sandbox_id)
+        await self.close_client()
+
+    async def close_client(self) -> None:
+        """Stop the session's data-plane credential renewal and close the client this handle owns. The SDK's
+        close_if_open skips that renewal for a session it already sees ending, which then outlives the client."""
+        reset = getattr(self._session, "_reset_data_plane", None)
+        if reset is not None:
+            await reset()
         client, self._client = self._client, None
         if client is not None:
             await client.close()
@@ -181,12 +208,12 @@ class TenkiSandbox(VmSandbox):
     async def exec(self, *command: str) -> _CompletedProcess:
         """Run argv to completion as root, so a leading ``sudo`` is dropped. A lost stream is exit -1, which
         ``exec_script`` retries."""
-        return await self._run(*command, timeout=self._command_timeout)
+        return await self._run(*command, timeout=self.command_timeout)
 
     async def exec_with_output(self, *args: str) -> tuple[int, str, str]:
         """An exec whose stream was cut (exit -1) returns no stdout, so a caller that skips the exit code can't mistake
         partial output for the whole."""
-        exit_code, stdout, stderr = await self._exec_with_output_bounded(*args, timeout=self._command_timeout)
+        exit_code, stdout, stderr = await self._exec_with_output_bounded(*args, timeout=self.command_timeout)
         return exit_code, "" if exit_code == _UNKNOWN_EXIT_CODE else stdout, stderr
 
     async def _run(self, *command: str, timeout: int) -> _CompletedProcess:
@@ -200,7 +227,8 @@ class TenkiSandbox(VmSandbox):
         if result.timed_out:
             note = f"\ncommand timed out after {timeout}s".encode()
             return _CompletedProcess(result.stdout, result.stderr + note, _TIMED_OUT_EXIT_CODE)
-        return _CompletedProcess(result.stdout, result.stderr, result.exit_code)
+        exit_code, note = _exit_status(result)
+        return _CompletedProcess(result.stdout, result.stderr + note, exit_code)
 
     async def _exec_with_output_bounded(self, *command: str, timeout: int) -> tuple[int, str, str]:
         process = await self._run(*command, timeout=timeout)
@@ -209,17 +237,19 @@ class TenkiSandbox(VmSandbox):
 
     async def _exec_with_stdin(self, script: str, stdin: AsyncIterator[bytes]) -> tuple[int, str, str]:
         """Run ``script`` with bash as root, its standard input the bytes ``stdin`` yields."""
-        process = await self._session.start("bash", "-c", script, timeout=self._command_timeout, privileged=True)
+        process = await self._session.start("bash", "-c", script, timeout=self.command_timeout, privileged=True)
         try:
             async for piece in stdin:
                 await process.write_stdin(piece)
-                await self._wait_for_stdin_drain(process)
+                if await self._wait_for_stdin_drain(process):
+                    break
             await process.close_stdin()
             result = await process.wait()
         except BaseException:
             await self._reap(process)
             raise
-        return result.exit_code, result.stdout_text, result.stderr_text
+        exit_code, note = _exit_status(result)
+        return exit_code, result.stdout_text, result.stderr_text + note.decode()
 
     @staticmethod
     async def _reap(process: Any) -> None:
@@ -232,19 +262,19 @@ class TenkiSandbox(VmSandbox):
                 logger.debug("Reaping a failed stdin exec: %s: %s", type(exc).__name__, exc)
 
     @staticmethod
-    async def _wait_for_stdin_drain(process: Any) -> None:
+    async def _wait_for_stdin_drain(process: Any) -> bool:
         """The SDK queues stdin without bound, so a fast reader would buffer a whole object in memory; wait for the
-        stream to catch up. A stream that ended stops draining: its error is raised, or the next write reports it."""
+        stream to catch up. True once the command has ended, so the caller stops reading input nobody will consume;
+        a stream that ended in error raises it."""
         queue = getattr(process, "_outbound", None)
         done = getattr(process, "_done", None)
         if not isinstance(queue, asyncio.Queue) or not isinstance(done, asyncio.Event):
-            return
-        while queue.qsize() > _STDIN_QUEUE_LIMIT:
-            if done.is_set():
-                if (error := getattr(process, "_error", None)) is not None:
-                    raise error
-                return
+            return False
+        while not done.is_set() and queue.qsize() > _STDIN_QUEUE_LIMIT:
             await asyncio.sleep(0.005)
+        if done.is_set() and (error := getattr(process, "_error", None)) is not None:
+            raise error
+        return done.is_set()
 
     async def wait_for_vm(self) -> None:
         """Install Docker and Compose v2 if the image lacks them, start the daemon and wait for it."""

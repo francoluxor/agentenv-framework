@@ -89,7 +89,8 @@ provider starts.
   snapshot; a smaller one would cold boot, which is slower. A request beyond Tenki's limits (128 vCPU, 512 GiB memory,
   100 GB disk, or the workspace's own lower limit) is refused, not shrunk.
 - **Lifetime:** the sandbox's `timeout` is the VM's hard maximum lifetime, so a crashed run can't leak a VM past it. It
-  is also every command's execution budget.
+  is also every command's execution budget. Tenki caps it at the workspace's maximum session duration; a capped VM
+  logs a warning and its commands get the lifetime it was granted.
 - **Commands:** run as root through Tenki's privileged exec, so the `sudo` agent-env prefixes is dropped.
 - **Ports:** each exposed port gets a public HTTPS URL under `sb.tenki.sh`, which fills `tunnel_urls`. It serves HTTP
   and WebSocket with no platform authentication.

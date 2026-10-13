@@ -102,6 +102,7 @@ async def _tensorlake() -> Sandbox:
 async def _tenki() -> Sandbox:
     session = MagicMock(id="tenki-test")
     session.wait_ready = AsyncMock()
+    session.info.timeout_at = None
     client = MagicMock()
     client.create = AsyncMock(return_value=session)
     provider = TenkiSandboxProvider(api_key="test-key", client_cls=MagicMock(return_value=client))
