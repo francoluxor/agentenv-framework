@@ -88,6 +88,7 @@ dev = [
     { name = "pytest-xdist" },
     { name = "requests" },
     { name = "sail" },
+    { name = "tenki", extra = ["async"] },
     { name = "tensorlake" },
     { name = "uvicorn" },
 ]
@@ -105,6 +106,9 @@ gcp = [
 sail = [
     { name = "sail" },
 ]
+tenki = [
+    { name = "tenki", extra = ["async"] },
+]
 tensorlake = [
     { name = "tensorlake" },
 ]
@@ -112,7 +116,7 @@ tensorlake = [
 [package.metadata]
 requires-dist = [
     { name = "a2a-sdk", specifier = "==0.3.26" },
-    { name = "agentenv-framework", extras = ["aws", "explorer", "gcp", "sail", "tensorlake"], marker = "extra == 'dev'" },
+    { name = "agentenv-framework", extras = ["aws", "explorer", "gcp", "sail", "tensorlake", "tenki"], marker = "extra == 'dev'" },
     { name = "agentenv-framework-protocol", editable = "packages/agentenv-protocol" },
     { name = "boto3", marker = "extra == 'aws'", specifier = ">=1.35.0" },
     { name = "botocore", marker = "extra == 'aws'", specifier = ">=1.35.0" },
@@ -147,11 +151,12 @@ requires-dist = [
     { name = "requests", marker = "extra == 'gcp'", specifier = ">=2.31" },
     { name = "sail", marker = "extra == 'sail'", specifier = "~=0.12.8" },
     { name = "starlette", specifier = ">=0.40" },
+    { name = "tenki", extras = ["async"], marker = "extra == 'tenki'", specifier = "~=1.4.1" },
     { name = "tensorlake", marker = "extra == 'tensorlake'", specifier = "~=0.5.140" },
     { name = "uvicorn", specifier = ">=0.47" },
     { name = "uvicorn", marker = "extra == 'explorer'", specifier = ">=0.29" },
 ]
-provides-extras = ["aws", "explorer", "gcp", "sail", "tensorlake", "dev"]
+provides-extras = ["aws", "explorer", "gcp", "sail", "tensorlake", "tenki", "dev"]
 
 [[package]]
 name = "agentenv-framework-protocol"
@@ -3427,6 +3432,25 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ee/5f/9f6f7df5919f0d085013b96b9cb99b622b974fe722a04c126c10497bba8b/synchronicity-0.12.6.tar.gz", hash = "sha256:ac971eadb64c95938816b8d6125d6e28473982f3256789a35bdbe02025e1ce17", size = 62425, upload-time = "2026-10-02T15:41:43.739Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4e/9c/8408129632f2cbd70018cff4a7eb78cc105b141de233b699feeda15d44c9/synchronicity-0.12.6-py3-none-any.whl", hash = "sha256:bc2bab6dde31f6bd9389912cef573b7fa7a5cb4a120ec786275e3284f06473ae", size = 41971, upload-time = "2026-10-02T15:41:42.672Z" },
+]
+
+[[package]]
+name = "tenki"
+version = "1.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "protobuf" },
+    { name = "websocket-client" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3c/59/93036224f9c175af8d7653e618f385ded93f873da5b727755f519ca5b75c/tenki-1.4.1.tar.gz", hash = "sha256:ff361ce1ef7b1676ce8fea519aa63cbce8cb1c1d98fc989d1fde1ff6ef8a79ae", size = 290340, upload-time = "2026-10-01T15:26:19.115Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4c/00/f5c5d6b8f75acf6cc2e25128e9418eddadf63571497b6b04e524d5ac09c8/tenki-1.4.1-py3-none-any.whl", hash = "sha256:c48352be3d1c514c7e47aa5264e55723675510ce4a20a025a2dedb1d83dcfada", size = 199117, upload-time = "2026-10-01T15:26:17.517Z" },
+]
+
+[package.optional-dependencies]
+async = [
+    { name = "websockets" },
 ]
 
 [[package]]
