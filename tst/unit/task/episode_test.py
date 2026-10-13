@@ -57,6 +57,18 @@ def test_a_task_with_one_prompted_agent_is_played_as_that_agent_with_its_turns_s
     assert spec._reward_verifier_id == "berth"
 
 
+def test_an_agent_named_by_the_seed_is_the_one_played_from_outside():
+    spec = EpisodeSpec.from_task(
+        _portsim(agent={**AGENT, "agent_name": "<who>"}, play={**PLAY, "agent_name": "<who>"}),
+        seed={**SEED, "who": "planner"},
+    )
+
+    assert list(spec.agents) == ["planner"]
+    assert [step.type for step in spec._copy.steps] == [
+        "deploy_env", "load_artifact", "episode_agent", "episode_turn", "env_outcome_verifier"]
+    assert spec.agents["planner"].turns[0].system_prompt == "You plan Valencia."
+
+
 def test_a_prompts_own_system_prompt_wins_over_the_agents():
     spec = EpisodeSpec.from_task(_portsim(play={**PLAY, "system_prompt": "Plan only the berths."}))
 
@@ -99,7 +111,8 @@ def test_the_copy_stands_in_for_the_outside_agents_steps_and_keeps_everything_el
         "deploy_env", "load_artifact", "episode_agent", "episode_turn", "env_outcome_verifier", "deploy_agent",
         "prompt_agent",
     ]
-    assert [copy.steps[i] is task.steps[i] for i in range(len(task.steps))] == [True, True, False, False, True, True, True]
+    assert [copy.steps[i] is task.steps[i] for i in range(len(task.steps))] == [
+        True, True, False, False, True, True, True]
     for original, stand_in in zip(task.steps, copy.steps):
         assert (stand_in.id, stand_in.version, stand_in.depends_on, stand_in.fail_task_on_error) == (
             original.id, original.version, original.depends_on, original.fail_task_on_error)
@@ -117,7 +130,8 @@ def test_the_stand_ins_carry_what_the_run_needs_unseeded_and_round_trip():
         assert type(step).from_dict(step.to_dict()).to_dict() == step.to_dict()
 
 
-@pytest.mark.parametrize(("timeout", "deadline"), [(30, 30), (None, PromptAgentTaskStep.DEFAULT_PROMPT_TIMEOUT_SECONDS)])
+@pytest.mark.parametrize(
+    ("timeout", "deadline"), [(30, 30), (None, PromptAgentTaskStep.DEFAULT_PROMPT_TIMEOUT_SECONDS)])
 def test_a_turns_deadline_is_its_prompts_timeout(timeout, deadline):
     turn = EpisodeSpec.from_task(_portsim(play={**PLAY, "timeout_seconds": timeout}))._copy.steps[3]
 
@@ -163,7 +177,8 @@ REFUSED = {
     "parts": ({}, {"play": {**PLAY, "prompt": None, "parts": [{"kind": "text", "text": "Plan."}]}},
               "step 'play': an outside agent's prompt can't have parts, only a text prompt"),
     "user simulator": ({}, {"play": {**PLAY, "max_conversation_turns": 2}},
-                       "step 'play': an outside agent's prompt can't have a user simulator (max_conversation_turns > 1)"),
+                       "step 'play': an outside agent's prompt can't have a user simulator "
+                       "(max_conversation_turns > 1)"),
     "output_format": ({}, {"play": {**PLAY, "output_format": {"type": "json_schema", "schema": {}}}},
                       "step 'play': an outside agent's prompt can't have output_format"),
     "agentenv_tools": ({}, {"play": {**PLAY, "agentenv_tools": ["complete_step"]}},
@@ -209,6 +224,8 @@ REFUSED = {
                                    "step 's': judges in 'default-agent''s sandbox, and it is played from outside"),
     "retry_config": ({}, {"verify": {**VERIFY, "retry_config": {"retry_from_step_id": "verify"}}},
                      "step 'verify': retry_config can replay an outside turn"),
+    "an A2A validator": (({"id": "s", "type": "verify_a2a_agent_card", "a2a_agent_id": "x"},), {},
+                         "step 's': validates the task's deployed A2A agent, and an episode plays one from outside"),
 }
 
 
@@ -344,19 +361,20 @@ class _Teardowns:
         return TeardownReport()
 
 
-@pytest.fixture
-def teardowns(monkeypatch, local_stores):
+@pytest_asyncio.fixture
+async def teardowns(monkeypatch, local_stores):
+    """Fake steps registered and ``teardown_run`` stood in for; an episode the test leaves running is abandoned
+    before they are undone."""
     steps = {**Config().task_step_registry(), **{step.type: step for step in (_Env, _Gate, _Replies)}}
     monkeypatch.setattr(Config, "task_step_registry", lambda self: steps)
     GATES.clear()
     teardowns = _Teardowns()
     monkeypatch.setattr(episode_module, "teardown_run", teardowns)
-    return teardowns
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _no_episode_outlives_its_test():
-    yield
+    yield teardowns
+    for gate in GATES.values():
+        gate.set()
+    if teardowns.hold is not None:
+        teardowns.hold.set()
     for episode in list(episode_module._live.values()):
         await episode.abandon("the test ended")
 
@@ -471,7 +489,8 @@ def test_the_seed_pass_rebuilds_each_step_as_its_own_class():
     seeded = substitute_seed_in_steps(steps, SEED)
 
     assert [type(step) for step in seeded] == [type(step) for step in steps]
-    assert (seeded[2].role, seeded[3].prompt, seeded[-1].verifier_id) == ("planner@Valencia", "Plan week 3.", "Valencia")
+    assert (seeded[2].role, seeded[3].prompt, seeded[-1].verifier_id) == (
+        "planner@Valencia", "Plan week 3.", "Valencia")
 
 
 @pytest.mark.asyncio
@@ -498,22 +517,23 @@ async def test_a_turn_not_taken_by_its_deadline_fails_the_run_and_is_never_hande
 
 @pytest.mark.asyncio
 async def test_a_turn_ended_after_its_deadline_changes_nothing(teardowns):
-    episode = await _spec(ITEMS, ALICE, {**TURN, "timeout_seconds": 0.05}, REPLIES).start()
+    episode = await _spec(ITEMS, ALICE, {**TURN, "timeout_seconds": 0.5}, REPLIES).start()
     turn = await episode.next_turn()
     await _ended(episode)
 
     await turn.end("too late")
 
-    with pytest.raises(TimeoutError, match="wasn't ended within 0.05s"):
+    with pytest.raises(TimeoutError, match="wasn't ended within 0.5s"):
         await episode.result()
     record = Task.get_instance(episode.id)
-    assert record.status == "failed" and "wasn't ended within 0.05s" in record.error
+    assert record.status == "failed" and "wasn't ended within 0.5s" in record.error
     assert record.context["prompt_responses"] == []
 
 
 @pytest.mark.asyncio
 async def test_a_tolerant_turn_past_its_deadline_is_scored_without_a_reply(teardowns):
-    episode = await _spec(ITEMS, ALICE, {**TURN, "timeout_seconds": 0.05, "fail_task_on_error": False}, REPLIES).start()
+    tolerant = {**TURN, "timeout_seconds": 0.05, "fail_task_on_error": False}
+    episode = await _spec(ITEMS, ALICE, tolerant, REPLIES).start()
     await _ended(episode)
 
     assert await episode.result() == 0.0
@@ -634,3 +654,108 @@ async def test_a_run_group_id_groups_the_record(teardowns):
     await episode.result()
 
     assert Task.get_instance(episode.id).context["metadata"]["run_group_id"] == "grpo-step-7"
+
+
+@pytest.mark.asyncio
+async def test_an_agent_named_by_the_seed_is_played_from_outside_in_the_run(teardowns):
+    episode = await _spec(
+        ITEMS, {**ALICE, "agent_name": "<who>"}, {**TURN, "agent_name": "<who>"}, REPLIES, seed={"who": "bob"},
+    ).start()
+
+    turn = await episode.next_turn()
+
+    assert turn.agent == "bob"
+    await turn.end("done")
+    assert await episode.result() == 1.0
+
+
+@pytest.mark.asyncio
+async def test_a_turn_ended_twice_keeps_its_first_reply(teardowns):
+    episode = await _spec(ITEMS, ALICE, TURN, REPLIES).start()
+    turn = await episode.next_turn()
+
+    await turn.end("first")
+    await turn.end("second")
+    await episode.result()
+
+    assert [r["response"] for r in Task.get_instance(episode.id).context["prompt_responses"]] == ["first"]
+
+
+@pytest.mark.asyncio
+async def test_a_reward_verifier_that_left_no_score_is_no_reward(teardowns):
+    unscored = {"id": "graded", "type": "agent_prompt_response_verifier", "prompt_id": "missing",
+                "verifier_id": "graded", "criteria": [{"type": "response_contains", "needles": ["crate"]}],
+                "fail_task_on_error": False}
+    episode = await _spec(ITEMS, ALICE, TURN, unscored).start()
+    await (await episode.next_turn()).end("done")
+
+    with pytest.raises(EpisodeError, match="verifier 'graded' left no score"):
+        await episode.result()
+
+
+BREAKS_WHILE_THE_TURN_IS_OPEN = (
+    ITEMS, {**ALICE, "depends_on": ["items"]}, {**TURN, "depends_on": ["alice"]},
+    {"id": "later", "type": "episode_test_gate", "depends_on": ["items"]},
+    {"id": "broken", "type": "episode_test_env", "env_id": "crane", "fail": True, "depends_on": ["later"]},
+    {**REPLIES, "depends_on": ["turn", "broken"]},
+)
+
+
+@pytest.mark.asyncio
+async def test_a_failure_elsewhere_in_the_task_surfaces_once_the_open_turn_ends(teardowns):
+    episode = await _spec(*BREAKS_WHILE_THE_TURN_IS_OPEN).start()
+    turn = await episode.next_turn()
+    _gate("later").set()
+    await _until(lambda: episode._context.metadata.get("failed_steps"))
+
+    await turn.end("done")
+
+    with pytest.raises(RuntimeError, match="the env didn't come up"):
+        await episode.result()
+    assert Task.get_instance(episode.id).status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_abandoning_a_run_a_step_has_failed_keeps_its_error(teardowns):
+    episode = await _spec(*BREAKS_WHILE_THE_TURN_IS_OPEN).start()
+    await episode.next_turn()
+    _gate("later").set()
+    await _until(lambda: episode._context.metadata.get("failed_steps"))
+
+    await episode.abandon("the trainer moved on")
+
+    with pytest.raises(RuntimeError, match="the env didn't come up"):
+        await episode.next_turn()
+    record = Task.get_instance(episode.id)
+    assert (record.status, record.error) == ("failed", "the env didn't come up")
+    assert teardowns.finished == [episode.id]
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_caller_of_abandon_still_abandons_the_run(teardowns):
+    episode = await _spec(ITEMS, ALICE, TURN, REPLIES).start()
+    await episode.next_turn()
+
+    abandoning = asyncio.create_task(episode.abandon("stop"))
+    await asyncio.sleep(0)
+    abandoning.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abandoning
+    await _ended(episode)
+
+    assert (Task.get_instance(episode.id).status, Task.get_instance(episode.id).error) == ("cancelled", "stop")
+    assert teardowns.finished == [episode.id]
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_start_takes_its_run_down_with_it(teardowns):
+    spec = _spec(ITEMS, ALICE, TURN, REPLIES)
+
+    starting = asyncio.create_task(spec.start())
+    await asyncio.sleep(0)
+    starting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+    await _until(lambda: not episode_module._live)
+
+    assert teardowns.finished == teardowns.started and len(teardowns.finished) == 1

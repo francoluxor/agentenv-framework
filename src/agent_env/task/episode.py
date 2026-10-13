@@ -78,10 +78,12 @@ class EpisodeSpec:
         if problems:
             raise EpisodeError(f"task {task.id!r} can't run as an episode: " + "; ".join(problems))
         deploys = {
-            step.agent_name: step for step in task.steps if step.type == "deploy_agent" and step.agent_name in outside
+            as_run.agent_name: step for step, as_run in zip(task.steps, seeded)
+            if step.type == "deploy_agent" and as_run.agent_name in outside
         }
+        steps = [_stand_in(step, as_run, deploys) for step, as_run in zip(task.steps, seeded)]
         return cls(
-            copy=Task(id=task.id, version=task.version, steps=[_stand_in(step, deploys) for step in task.steps]),
+            copy=Task(id=task.id, version=task.version, steps=steps),
             agents={name: _agent_spec(seeded, name) for name in outside},
             reward_verifier_id=verifiers[0].verifier_id,
             seed=seed,
@@ -100,7 +102,12 @@ class EpisodeSpec:
         _live[episode_id] = episode
         running = asyncio.Event()
         episode._run = asyncio.create_task(episode._drive(running))
-        await running.wait()
+        try:
+            await running.wait()
+        except asyncio.CancelledError:
+            episode._abandoned = "start() was cancelled"
+            episode._run.cancel()
+            raise
         return episode
 
 
@@ -141,7 +148,7 @@ class Episode:
         self._bindings: dict[str, tuple[str | None, dict[str, str]]] = {}
         self._waiting: deque[Turn] = deque()
         self._turns: set[Turn] = set()
-        self._changed = asyncio.Event()
+        self._changed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._tearing_down = False
         self._abandoned: str | None = None
 
@@ -149,7 +156,7 @@ class Episode:
         """The next outside turn the run reaches, or None once the run has finished. Raises the run's error if it
         failed first. End the turns you hold before waiting on one that depends on them."""
         while True:
-            self._changed.clear()
+            changed = self._changed
             while self._waiting and self._abandoned is None:
                 turn = self._waiting.popleft()
                 if not turn._reply.done():
@@ -157,17 +164,17 @@ class Episode:
             if self._run.done():
                 self._raise_unless_completed()
                 return None
-            await self._wait()
+            await self._wait(changed)
 
     async def result(self) -> float:
         """The reward, once the run and its teardown are over: the score of the task's one top-level verifier."""
         while not self._run.done():
-            self._changed.clear()
+            changed = self._changed
             if open_turn := next((turn for turn in self._turns if not turn._reply.done()), None):
                 raise EpisodeError(
                     f"turn {open_turn.step_id!r} of agent {open_turn.agent!r} isn't ended, so the run can't finish"
                 )
-            await self._wait()
+            await self._wait(changed)
         self._raise_unless_completed()
         verifier_id = self._spec._reward_verifier_id
         score = ((self._context.metadata.get("verifications") or {}).get(verifier_id) or {}).get("score")
@@ -176,11 +183,17 @@ class Episode:
         return float(score)
 
     async def abandon(self, reason: str) -> None:
-        """Stop the run and wait for its teardown; it is recorded cancelled with ``reason``. Once the run has
-        ended, or while it tears down, this only waits."""
+        """Stop the run and wait for its teardown; it is recorded cancelled with ``reason``. A run a step has
+        already failed is only finishing what's in flight, so this ends its open turns and the run's error stands.
+        Once the run has ended, or while it tears down, this only waits."""
         if not (self._run.done() or self._tearing_down or self._abandoned is not None):
-            self._abandoned = reason
-            self._run.cancel(msg=reason)
+            if any(failure.get("is_fatal") for failure in self._context.metadata.get("failed_steps") or []):
+                for turn in self._turns:
+                    if not turn._reply.done():
+                        turn._reply.set_exception(EpisodeError(f"episode abandoned: {reason}"))
+            else:
+                self._abandoned = reason
+                self._run.cancel(msg=reason)
         await asyncio.wait((self._run,))
 
     async def _drive(self, running: asyncio.Event) -> None:
@@ -198,13 +211,9 @@ class Episode:
             finally:
                 del _live[self.id]
 
-    async def _wait(self) -> None:
-        """Until a turn arrives or the run ends."""
-        changed = asyncio.ensure_future(self._changed.wait())
-        try:
-            await asyncio.wait((self._run, changed), return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            changed.cancel()
+    async def _wait(self, changed: asyncio.Future[None]) -> None:
+        """Until the run ends or what was ``changed`` when the caller last looked changes again."""
+        await asyncio.wait((self._run, changed), return_when=asyncio.FIRST_COMPLETED)
 
     def _raise_unless_completed(self) -> None:
         if self._abandoned is not None:
@@ -222,7 +231,8 @@ class Episode:
                     role=role, mcp_urls=dict(mcp_urls))
         self._waiting.append(turn)
         self._turns.add(turn)
-        self._changed.set()
+        self._changed.set_result(None)
+        self._changed = asyncio.get_running_loop().create_future()
         try:
             return await asyncio.wait_for(turn._reply, step.timeout_seconds)
         except TimeoutError:
@@ -234,10 +244,7 @@ class Episode:
 
 
 def _episode_of(context: TaskStepContext) -> Episode:
-    episode = _live.get((context.metadata.get("episode") or {}).get("id"))
-    if episode is None:
-        raise RuntimeError("episode_agent and episode_turn steps run only in the run of an episode")
-    return episode
+    return _live[context.metadata["episode"]["id"]]
 
 
 def _outside_agents(task: Task, steps: list[TaskStep], agents: Sequence[str] | None) -> list[str]:
@@ -301,6 +308,8 @@ def _step_problems(step: TaskStep, outside: list[str], outside_prompts: dict[str
         )
     elif step.type in _AGENT_DEPLOYERS and agent in outside:
         why.append(f"{step.type} deploys {agent!r}, which is played from outside")
+    elif step.type.startswith("verify_a2a_"):
+        why.append("validates the task's deployed A2A agent, and an episode plays one from outside")
     elif step.type in _AGENT_TARGETING and agent in outside:
         why.append(f"{step.type} needs {agent!r} as a real agent, and it is played from outside")
     elif step.type == "collect_artifacts":
@@ -337,19 +346,21 @@ def _agent_spec(steps: list[TaskStep], name: str) -> AgentSpec:
     ))
 
 
-def _stand_in(step: TaskStep, deploys: dict[str, TaskStep]) -> TaskStep:
-    """The step the episode's copy of the task runs in place of ``step``; ``deploys`` are the outside agents'."""
-    if step.type == "deploy_agent" and step.agent_name in deploys:
+def _stand_in(step: TaskStep, as_run: TaskStep, deploys: dict[str, TaskStep]) -> TaskStep:
+    """The step the episode's copy of the task runs in place of ``step``, judged by ``as_run``, the step as the
+    seed makes it; ``deploys`` are the outside agents', by name. A stand-in keeps the step's own fields, which the
+    run seeds."""
+    if as_run.type == "deploy_agent" and as_run.agent_name in deploys:
         return _EpisodeAgentStep(
             id=step.id, version=step.version, depends_on=step.depends_on, fail_task_on_error=step.fail_task_on_error,
             agent_name=step.agent_name, env_ids=step.env_ids, env_step_id=step.env_step_id, role=step.role,
         )
-    if step.type == "prompt_agent" and step.agent_name in deploys:
+    if as_run.type == "prompt_agent" and as_run.agent_name in deploys:
         timeout = step.timeout_seconds
         return _EpisodeTurnStep(
             id=step.id, version=step.version, depends_on=step.depends_on, fail_task_on_error=step.fail_task_on_error,
             agent_name=step.agent_name, prompt_id=step.prompt_id, prompt=step.prompt,
-            system_prompt=step.system_prompt or deploys[step.agent_name].system_prompt,
+            system_prompt=step.system_prompt or deploys[as_run.agent_name].system_prompt,
             timeout_seconds=PromptAgentTaskStep.DEFAULT_PROMPT_TIMEOUT_SECONDS if timeout is None else timeout,
         )
     return step

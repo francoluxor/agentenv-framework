@@ -241,8 +241,10 @@ async def test_a_tasks_agent_is_played_from_a_loop_of_ones_own_as_an_episode(loc
         await turn.end("Added a crate." if add else None)
         return await episode.result()
 
+    sandboxes = tmp_path / "sandboxes"
     played, unplayed = await spec.start(), await spec.start()
     assert await asyncio.gather(play(played, True), play(unplayed, False)) == [1.0, 0.0]
+    assert list(sandboxes.glob("agent-env-*")) == []
     record = Task.get_instance(played.id)
     assert record.status == "completed" and record.context["metadata"]["episode"]["agents"] == ["policy"]
     assert [agent["agent_name"] for agent in record.context["deployed_agents"]] == ["echo"]
@@ -251,10 +253,10 @@ async def test_a_tasks_agent_is_played_from_a_loop_of_ones_own_as_an_episode(loc
 
     abandoned = await spec.start()
     await abandoned.next_turn()
+    assert len(list(sandboxes.glob("agent-env-*"))) == 2
     await abandoned.abandon("test")
     assert (Task.get_instance(abandoned.id).status, Task.get_instance(abandoned.id).error) == ("cancelled", "test")
-
-    assert list((tmp_path / "sandboxes").glob("agent-env-*")) == []
+    assert list(sandboxes.glob("agent-env-*")) == []
     for episode in (played, unplayed, abandoned):
         context = Task.get_instance(episode.id).context
         sandbox_ids = [entry["sandbox_id"] for key in ("deployed_envs", "deployed_agents")
