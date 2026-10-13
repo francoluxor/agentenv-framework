@@ -138,6 +138,13 @@ def test_a_turns_deadline_is_its_prompts_timeout(timeout, deadline):
     assert turn.timeout_seconds == deadline
 
 
+def test_a_turn_timeout_replaces_every_outside_prompts_own():
+    again = {**PLAY, "id": "replan", "prompt_id": "replan", "timeout_seconds": 60}
+    copy = EpisodeSpec.from_task(_portsim(again, play={**PLAY, "timeout_seconds": 7200}), turn_timeout=90)._copy
+
+    assert [step.timeout_seconds for step in copy.steps if step.type == "episode_turn"] == [90, 90]
+
+
 def test_an_inside_agent_keeps_its_own_steps():
     copy = EpisodeSpec.from_task(_portsim(BOB, ASK_BOB), agents=["bob"])._copy
 

@@ -33,7 +33,7 @@ _AGENT_TARGETING = (
 _live: dict[str, Episode] = {}
 
 
-class EpisodeError(ValueError):
+class EpisodeError(RuntimeError):
     """A task that can't run as an episode, or an episode asked for what it can't give."""
 
 
@@ -64,7 +64,10 @@ class EpisodeSpec:
     @classmethod
     def from_task(
         cls, task: Task, *, agents: Sequence[str] | None = None, seed: Mapping[str, str] | None = None,
+        turn_timeout: float | None = None,
     ) -> EpisodeSpec:
+        """``turn_timeout`` is every outside turn's deadline in seconds, in place of its prompt's own
+        ``timeout_seconds``, which budgets an agent's run rather than the loop playing it."""
         seed = dict(seed) if seed else None
         seeded = substitute_seed_in_steps(task.steps, seed or {})
         outside = _outside_agents(task, seeded, agents)
@@ -81,7 +84,7 @@ class EpisodeSpec:
             as_run.agent_name: step for step, as_run in zip(task.steps, seeded)
             if step.type == "deploy_agent" and as_run.agent_name in outside
         }
-        steps = [_stand_in(step, as_run, deploys) for step, as_run in zip(task.steps, seeded)]
+        steps = [_stand_in(step, as_run, deploys, turn_timeout) for step, as_run in zip(task.steps, seeded)]
         return cls(
             copy=Task(id=task.id, version=task.version, steps=steps),
             agents={name: _agent_spec(seeded, name) for name in outside},
@@ -346,7 +349,7 @@ def _agent_spec(steps: list[TaskStep], name: str) -> AgentSpec:
     ))
 
 
-def _stand_in(step: TaskStep, as_run: TaskStep, deploys: dict[str, TaskStep]) -> TaskStep:
+def _stand_in(step: TaskStep, as_run: TaskStep, deploys: dict[str, TaskStep], turn_timeout: float | None) -> TaskStep:
     """The step the episode's copy of the task runs in place of ``step``, judged by ``as_run``, the step as the
     seed makes it; ``deploys`` are the outside agents', by name. A stand-in keeps the step's own fields, which the
     run seeds."""
@@ -356,7 +359,7 @@ def _stand_in(step: TaskStep, as_run: TaskStep, deploys: dict[str, TaskStep]) ->
             agent_name=step.agent_name, env_ids=step.env_ids, env_step_id=step.env_step_id, role=step.role,
         )
     if as_run.type == "prompt_agent" and as_run.agent_name in deploys:
-        timeout = step.timeout_seconds
+        timeout = step.timeout_seconds if turn_timeout is None else turn_timeout
         return _EpisodeTurnStep(
             id=step.id, version=step.version, depends_on=step.depends_on, fail_task_on_error=step.fail_task_on_error,
             agent_name=step.agent_name, prompt_id=step.prompt_id, prompt=step.prompt,
@@ -408,7 +411,7 @@ class _EpisodeTurnStep(TaskStep):
 
     def __init__(
         self, id: str, version: Optional[int], *, agent_name: str, prompt_id: str, prompt: str,
-        system_prompt: str | None, timeout_seconds: int, depends_on: Optional[list] = None,
+        system_prompt: str | None, timeout_seconds: float, depends_on: Optional[list] = None,
         fail_task_on_error: bool = True,
     ):
         super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
